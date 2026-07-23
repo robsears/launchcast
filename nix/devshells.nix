@@ -10,6 +10,7 @@ let
       matplotlib # plotting altitude/accel traces
       numpy # flight log analysis
       pyserial # serial console / decoder
+      pytest # test runner
       ruff # linter and code formatter
     ]
   );

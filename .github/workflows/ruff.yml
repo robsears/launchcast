@@ -1,0 +1,16 @@
+name: "LaunchControl CI Tests"
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    name: ci tests
+    permissions:
+      id-token: "write"
+      contents: "read"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: |
+          nix develop --accept-flake-config --command ruff check -- .
+      - run: |
+          nix develop --accept-flake-config --command python -m pytest -- tests/
