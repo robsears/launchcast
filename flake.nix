@@ -28,6 +28,7 @@
         );
     in
     {
+      apps = forAllSystems (args: import ./nix/apps.nix args);
       devShells = forAllSystems (args: import ./nix/devshells.nix args);
       formatter = forAllSystems ({ pkgs, ... }: pkgs.nixfmt-rfc-style);
     };

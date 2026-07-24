@@ -13,8 +13,10 @@ rec {
   );
 
   common = with pkgs; [
+    bash
     coreutils # GNU core utilities
     circup # installs/updates CircuitPython libraries on the board
+    git # how you running this if you don't already have git??
     gnumake # control the generation of non-source files from sources
     python # python with necessary packages; see above
   ];
