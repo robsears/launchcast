@@ -41,7 +41,7 @@ BAUD ?= 115200
 
 SHARED       := common/packet.py
 ROCKET_FILES := rocket/code.py rocket/boot.py $(SHARED)
-GROUND_FILES := ground/code.py $(SHARED)
+GROUND_FILES := ground/code.py ground/boot.py $(SHARED)
 
 ROCKET_LIBS := adafruit_rfm9x adafruit_gps adafruit_bmp5xx \
                adafruit_lsm6ds adafruit_lis3mdl neopixel
