@@ -2,7 +2,7 @@
 
 The Feather is based on the "32-bit dual-core ARM Cortex-M0+ microcontroller designed by Raspberry Pi Ltd. In January 2021, it was released as part of the Raspberry Pi Pico board." [[1](https://en.wikipedia.org/wiki/RP2040)]. The pinout is this:
 
-![image](./images/feather pinout.png)
+![image](./images/feather%20pinout.png)
 
 Use this as a reference for wiring the payload and handheld units.
 
@@ -12,7 +12,7 @@ Wiring the payload is pretty simple. The modules for the GPS, motion and environ
 
 I also made up a quick and dirty voltage divider with two 100 kΩ resistors:
 
-![image](./images/voltage divider.png)
+![image](./images/voltage%20divider.png)
 
 I measured the resistor to be 99.9 kΩ, right is 97.2 kΩ, it’s 198.4 kΩ across both. The joined leads were soldered to A0, and the other ends are soldered to BAT and GND, respectively.
 
@@ -35,7 +35,7 @@ PA1010D GPS is connected to the Feather via Qwiic JST SH 4-pin, same as the payl
 
 Also like the payload, I made a voltage divider (measured at 99.9 kΩ and 99.6 kΩ, and 198.6 kΩ across both), and cut some female-female jumper wires in half and soldered them to the ends. I also used some heat shrink tubes. That way I could plug it into the headers:
 
-![image](./images/voltage divider - handheld.png)
+![image](./images/voltage%20divider%20-%20handheld.png)
 
 Just like the payload, the ends connect to BAT and GND, and the joined end connects to A0.
 
