@@ -41,10 +41,10 @@ Just like the payload, the ends connect to BAT and GND, and the joined end conne
 
 Wiring the screen takes 5 wires:
 
-Screen -> Feather
-
-1. 3x3 (red)    -> 3.3V
-2. GND (black)  -> GND
-3. CLK (green)  -> SCK
-4. DI  (orange) -> MOSI
-5. CS  (yellow) -> D6
+| Adafruit SHARP Memory Display Breakout | Wire Color | Adafruit Feather RP2040 Pin |
+|----------------------------------------|------------|-----------------------------|
+| 3x3                                    | Red        | 3.3V                        |
+| GND                                    | Black      | GND                         |
+| CLK                                    | Green      | SCK                         |
+| DI                                     | Orange     | MOSI                        |
+| CS                                     | Yellow     | D6                          |
