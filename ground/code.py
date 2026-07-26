@@ -114,7 +114,7 @@ class Hardware:
             import adafruit_sharpmemorydisplay
 
             spi = board.SPI()
-            cs = digitalio.DigitalInOut(board.D12)  # verify against wiring
+            cs = digitalio.DigitalInOut(board.D6)  # verify against wiring
             self.display = adafruit_sharpmemorydisplay.SharpMemoryDisplay(
                 spi, cs, DISP_W, DISP_H
             )
@@ -490,7 +490,7 @@ def main():
             elif name == "arm" and event == "hold":
                 # Hold, not tap. A bumped button must not change rocket state.
                 seq += 1
-                armed = link.tel and link.tel["state"] == State.ARMED
+                armed = link.tel is not None and link.tel["state"] == State.ARMED
                 cmd = Command.DISARM if armed else Command.ARM
                 frame = packet.pack_command(seq, cmd)
                 tx_status = "sent {}".format("DISARM" if armed else "ARM")

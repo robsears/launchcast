@@ -48,7 +48,7 @@ LANDED_VEL_MPS = 0.5        # Landing detection: motion near-zero velocity...
 LANDED_ALT_M = 15.0         # ...near ground level
 LANDED_HOLD_MS = 3000       # ...for this long, means we've landed.
 
-BUZZER_HZ = 4000            # Piezo max-vol freq. TODO: re-tune per part after a bench sweep
+BUZZER_HZ = 5250            # Piezo max-vol freq.
 CHIRP_MS = 1000             # Duration of a commanded chirp
 
 BATT_DIVIDER = 2.0          # Onboard voltage divider ratio; 1.0 if reading BAT directly
@@ -563,7 +563,7 @@ def main():
                         if cmd == Command.ARM and fs.state == State.IDLE:
                             if not Sensor.flight_ready(sensors):
                                 print("ARM REFUSED -- not flight ready")
-                                # three fast chirps = refusal
+                                # 600ms steady tone = refusal
                                 chirp_until = now + 600
                             else:
                                 fs.set_ground_reference(pressure)
@@ -577,13 +577,12 @@ def main():
                         elif cmd == Command.CHIRP:
                             chirp_until = now + CHIRP_MS
 
-        # -- buzzer -----------------------------------------------------------
+# -- buzzer -----------------------------------------------------------
         if fs.state == State.LANDED:
-            # Pulsed, not steady: far easier to localize by ear.
-            if (now // 500) % 2 == 0:
-                hw.buzz_on()
-            else:
-                hw.buzz_off()
+            # DOT-DOT-DOT beacon: three 1/6 s pulses, then rest, every 2 s.
+            phase = now % 2000
+            on = phase < 167 or (334 <= phase < 500) or (667 <= phase < 834)
+            hw.buzz_on() if on else hw.buzz_off()
         elif now < chirp_until:
             hw.buzz_on()
         else:
