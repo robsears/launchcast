@@ -2,99 +2,64 @@
 LaunchCast boot.py -- rocket payload.
 
 Runs ONCE at power-on, before code.py, and cannot be re-run without a hard
-reset. Changing this file means unplug/replug to test it.
+reset. Editing this file means unplug/replug (or press RESET) to test it.
 
-The problem it solves: CircuitPython mounts its filesystem read-only to the
-BOARD whenever USB has it mounted read-write to the HOST. Only one side can
-write. Default is host-writable, which means code.py cannot append to
-flight.bin -- FlightLog silently disables itself and you fly with no dataset.
+Two jobs:
 
-The switch decides:
+  1. FLIGHT-MODE REMOUNT. CircuitPython mounts its filesystem read-only to the
+     BOARD whenever a USB host has it mounted read-write. Only one side can
+     write at a time, and the host wins by default -- which means code.py
+     cannot append to flight.bin and FlightLog silently disables itself.
 
-    switch ON  (pin reads LOW)  -> FLIGHT MODE
-                                   board can write, host filesystem read-only
-    switch OFF (pin reads HIGH) -> DEV MODE
-                                   host can write, board cannot log
+     We decide by USB data presence: no host connection -> flight mode ->
+     board writable. On battery at the pad, USB is absent, so flight mode is
+     automatic. On the bench over USB, the host keeps write access and you
+     edit normally (no logging, which is what you want while editing).
 
-This maps to the physical build: the slide switch already gates battery power
-to BAT. On battery, USB is absent and the switch is on, so flight mode is
-automatic. On the bench with USB and the switch off, you edit code normally.
+     supervisor.runtime.usb_connected reports the DATA link, not just 5 V, so
+     a wall charger on the pad still counts as "no host" -> flight mode.
 
-NOTE: the switch is on the BATTERY line, not a GPIO. If you want boot.py to
-sense it you must run a second wire from the switched side to ARM_PIN. If you
-would rather not, set USE_SWITCH = False below and the board decides by
-whether USB data is connected -- which is right most of the time and is one
-fewer wire.
+  2. VOLUME LABEL. Two identical Feathers both enumerate as CIRCUITPY, and it
+     is genuinely easy to deploy flight firmware to the handheld by mistake.
+     Labeling the volume LC-ROCKET lets `make deploy-rocket` target it
+     unambiguously. Setting a label requires a board-writable filesystem; in
+     flight mode we already have it, and in dev mode we grab it briefly just
+     for the label operation, then hand write access back to the host.
 """
 
-import board
-import digitalio
 import storage
 import supervisor
 
-# --- Configuration -----------------------------------------------------------
+LABEL = "LC-ROCKET"
 
-USE_SWITCH = False  # True = read ARM_PIN; False = decide from USB presence
-ARM_PIN = board.D13  # only used when USE_SWITCH is True
+# --- flight mode -------------------------------------------------------------
 
-# --- Mode selection ----------------------------------------------------------
+flight = not supervisor.runtime.usb_connected
 
-
-def _switch_says_flight():
-    """True when the arming switch is closed (pin pulled to GND)."""
-    pin = digitalio.DigitalInOut(ARM_PIN)
-    pin.direction = digitalio.Direction.INPUT
-    pin.pull = digitalio.Pull.UP
-    closed = not pin.value  # active low
-    pin.deinit()  # release it so code.py can claim the pin
-    return closed
-
-
-def _usb_says_flight():
-    """True when no USB data connection is present.
-
-    supervisor.runtime.usb_connected reports the DATA link, not merely
-    5 V. A USB wall charger reads False here, which is the behavior we
-    want -- charging on the pad should not disable logging.
-    """
-    try:
-        return not supervisor.runtime.usb_connected
-    except AttributeError:
-        # Older CircuitPython. Fall back to serial connection state, which
-        # is a weaker signal but better than assuming dev mode.
-        return not supervisor.runtime.serial_connected
-
-
-flight_mode = _switch_says_flight() if USE_SWITCH else _usb_says_flight()
-
-# --- Apply -------------------------------------------------------------------
-
-if flight_mode:
-    # readonly=False means the BOARD may write. The host sees a read-only
-    # drive. This is what lets FlightLog append to flight.bin.
+if flight:
+    # Board may write; host sees a read-only drive. This is what lets
+    # FlightLog append to /flight.bin.
     storage.remount("/", readonly=False)
-    print("boot: FLIGHT MODE -- board can write, host read-only")
-else:
-    print("boot: DEV MODE -- host can write, no flight logging")
 
-# --- Optional: distinct volume labels ----------------------------------------
-# Two identical Feathers both mount as CIRCUITPY, and it is genuinely easy to
-# deploy flight firmware to the handheld. Relabeling costs nothing and makes
-# the Makefile targets unambiguous.
-#
-# Uncomment ONE of these, per board. Takes effect after the next hard reset.
-#
-# storage.remount("/", readonly=False)
-# import microcontroller
-# microcontroller.nvm[0] = 1
-#
-# Simpler: use storage.getmount("/").label -- but note that changing the
-# label requires the filesystem to be board-writable at the time.
+# --- volume label ------------------------------------------------------------
+# The label persists in the filesystem, so this only does real work on the
+# first boot after deploy. Later boots see it is already set and skip.
 
 try:
     fs = storage.getmount("/")
-    if fs.label != "LC-ROCKET" and flight_mode:
-        fs.label = "LC-ROCKET"
-        print("boot: relabeled volume to LC-ROCKET")
+    if fs.label != LABEL:
+        if not flight:
+            # Dev mode: briefly take write access just to set the label,
+            # then return it to the host so normal editing still works.
+            storage.remount("/", readonly=False)
+        fs.label = LABEL
+        if not flight:
+            storage.remount("/", readonly=True)
+        print("boot: labeled", LABEL)
 except Exception as e:
     print("boot: label unchanged ({})".format(e))
+
+# --- report ------------------------------------------------------------------
+
+print("boot:", "FLIGHT MODE (board writes, host read-only)"
+      if flight else "DEV MODE (host writes, no flight logging)")

@@ -10,6 +10,8 @@
 #
 #   make test              run the suite
 #   make check             test + lint
+#   make setup-rocket      label a fresh board as LC-ROCKET (one-time)
+#   make setup-ground      label a fresh board as LC-GROUND (one-time)
 #   make deploy-rocket     copy payload firmware to the rocket board
 #   make deploy-ground     copy handheld firmware to the ground station
 #   make libs-rocket       install CircuitPython libraries on the rocket board
@@ -41,7 +43,7 @@ BAUD ?= 115200
 
 SHARED       := common/packet.py
 ROCKET_FILES := rocket/code.py rocket/boot.py $(SHARED)
-GROUND_FILES := ground/code.py ground/boot.py common/packet.py ground/font5x8.bin
+GROUND_FILES := ground/code.py ground/boot.py ground/font5x8.bin $(SHARED)
 
 ROCKET_LIBS := adafruit_rfm9x adafruit_gps adafruit_bmp5xx \
                adafruit_lsm6ds adafruit_lis3mdl neopixel
@@ -49,7 +51,8 @@ GROUND_LIBS := adafruit_rfm9x adafruit_gps adafruit_sharpmemorydisplay \
                adafruit_framebuf
 
 .PHONY: help test lint check fmt deploy-rocket deploy-ground \
-        libs-rocket libs-ground pull-log clean-log monitor volumes doctor
+        libs-rocket libs-ground pull-log clean-log monitor volumes doctor \
+		setup-rocket setup-ground
 
 help:
 	@grep -E '^#   make' $(MAKEFILE_LIST) | sed 's/^#   //'
@@ -66,6 +69,31 @@ fmt:
 	ruff format .
 
 check: test lint
+
+# --- First-time board setup --------------------------------------------------
+# Deploy boot.py to a fresh (unlabeled) board so it self-labels on next reset.
+# Plug in ONE board at a time. After running, press RESET, then `make volumes`
+# to confirm the label took.
+
+setup-rocket:
+	@test -n "$(ANY_VOL)" || { echo "no CIRCUITPY volume -- plug in ONE fresh board"; exit 1; }
+	@echo "deploying rocket boot.py to $(ANY_VOL)"
+	cp rocket/boot.py "$(ANY_VOL)/boot.py"
+	sync
+	@echo ""
+	@echo "  Done. Now press RESET on the board (or unplug/replug)."
+	@echo "  Then run:  make volumes   -- should show rocket: .../LC-ROCKET"
+	@echo "  If the label does not appear, unplug/replug once (host cache)."
+
+setup-ground:
+	@test -n "$(ANY_VOL)" || { echo "no CIRCUITPY volume -- plug in ONE fresh board"; exit 1; }
+	@echo "deploying ground boot.py to $(ANY_VOL)"
+	cp ground/boot.py "$(ANY_VOL)/boot.py"
+	sync
+	@echo ""
+	@echo "  Done. Now press RESET on the board (or unplug/replug)."
+	@echo "  Then run:  make volumes   -- should show ground: .../LC-GROUND"
+	@echo "  If the label does not appear, unplug/replug once (host cache)."
 
 # --- Deploy ------------------------------------------------------------------
 # Every deploy runs the tests first. A packet.py that fails its own round-trip

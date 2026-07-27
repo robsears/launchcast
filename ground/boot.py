@@ -1,32 +1,32 @@
-"""LaunchCast boot.py -- handheld ground station.
+"""
+LaunchCast boot.py -- handheld ground station.
 
-The handheld writes nothing to flash, so it stays in the default
-host-writable mode. This file exists only to label the volume, so that
-`make deploy-ground` cannot accidentally target the rocket board when
-both are plugged in.
+Runs ONCE at power-on, before code.py. Editing this file means unplug/replug
+(or press RESET) to test it.
 
-setting the label requires the filesystem to be board-writable at that
-moment, which by default it isn't. So this either needs a one-time
-storage.remount("/", readonly=False) before the relabel, or you set
-the label once manually from the REPL and then this file is a no-op
-that just confirms it.
+The handheld writes nothing to flash -- no flight log -- so it stays in the
+default host-writable mode and never needs a flight-mode remount. This file
+exists only to LABEL the volume LC-GROUND, so that `make deploy-ground` cannot
+accidentally target the rocket board when both are plugged in.
 
-Simplest path when hardware arrives: plug in the handheld board, open
-the REPL, and run:
-
-```
-import storage
-storage.remount("/", readonly=False)
-storage.getmount("/").label = "LC-GROUND"
-```
+Setting a label requires a board-writable filesystem, which by default is not
+the case over USB. So we briefly take write access just for the label, then
+hand it back to the host. The label persists, so this only does real work on
+the first boot after deploy; later boots see it is already set and skip.
 """
 
 import storage
 
+LABEL = "LC-GROUND"
+
 try:
     fs = storage.getmount("/")
-    if fs.label != "LC-GROUND":
-        fs.label = "LC-GROUND"
-        print("boot: relabeled volume to LC-GROUND")
+    if fs.label != LABEL:
+        storage.remount("/", readonly=False)   # board-writable, briefly
+        fs.label = LABEL
+        storage.remount("/", readonly=True)     # hand back to the host
+        print("boot: labeled", LABEL)
+    else:
+        print("boot: label OK ({})".format(LABEL))
 except Exception as e:
     print("boot: label unchanged ({})".format(e))

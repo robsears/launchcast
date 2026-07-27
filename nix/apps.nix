@@ -22,6 +22,8 @@ in
   test = mk "test" "test" [ ];
   lint = mk "lint" "lint" [ ];
   check = mk "check" "check" [ ];
+  setup-rocket = mk "setup-rocket" "setup-rocket" [ ];
+  setup-ground = mk "setup-ground" "setup-ground" [ ];
   deploy-rocket = mk "deploy-rocket" "deploy-rocket" [ ];
   deploy-ground = mk "deploy-ground" "deploy-ground" [ ];
   libs-rocket = mk "libs-rocket" "libs-rocket" [ ];
