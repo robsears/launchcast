@@ -8,33 +8,36 @@ A LoRa telemetry payload for model rockets, with a handheld ground station. Buil
 
 ### Rocket payload (~44 g)
 
-| Role | Part | PID |
+| Role | Part | Price (USD) |
 |---|---|---|
-| Flight computer + LoRa | Feather RP2040 RFM95 | 5714 |
-| Barometer | BMP580 | 6411 |
-| 9-DoF IMU | LSM6DSOX + LIS3MDL | 4517 |
-| GPS | Mini GPS PA1010D | 4415 |
-| Power | 500 mAh LiPo | 1578 |
-| Recovery aid | PS1240 piezo | 160 |
-| Antenna | 915 MHz spring | 4269 |
-| Structure | 3D-printed PETG sled | — |
+| Flight computer + LoRa | [Feather RP2040 RFM95](https://www.adafruit.com/product/5714) |  $29.95 |
+| GPS | [Mini GPS PA1010D](https://www.adafruit.com/product/4415) | $29.95 |
+| 9-DoF IMU | [LSM6DSOX + LIS3MDL](https://www.adafruit.com/product/4517) | $19.95 |
+| Barometer | [BMP580](https://www.adafruit.com/product/6411) | $7.95 |
+| Power | [3.7v 500 mAh LiPo](https://www.adafruit.com/product/1578) | $7.95 |
+| Recovery aid | [PS1240 piezo](https://www.adafruit.com/product/160) | $1.50 |
+| Antenna | [915 MHz spring](https://www.adafruit.com/product/4269) | $0.95 |
+| Total | - | **$97.75** |
 
 ### Handheld ground station
 
-| Role | Part | PID |
+| Role | Part | Price (USD) |
 |---|---|---|
-| Receiver | Feather RP2040 RFM95 | 5714 |
-| Display | Sharp Memory 2.7" 400×240 | 4694 |
-| GPS | Mini GPS PA1010D | 4415 |
-| Power | 2500 mAh LiPo | 328 |
+| Display | [Sharp Memory 2.7" 400×240](https://www.adafruit.com/product/4694) | $44.95 |
+| Flight computer + LoRa | [Feather RP2040 RFM95](https://www.adafruit.com/product/5714) |  $29.95 |
+| GPS | [Mini GPS PA1010D](https://www.adafruit.com/product/4415) | $29.95 |
+| Power | [3.7v 2500 mAh LiPo](https://www.adafruit.com/product/5714) | $14.95 |
+| Tactile Inputs | [Universal Proto-board PCBs 2cm x 8cm - 3 Pack](https://www.adafruit.com/product/4783)<br />[Colorful Round Tactile Button Switch Assortment - 15 pack](https://www.adafruit.com/product/1009) | $8.20|
+| Antenna | [SMA to uFL/u.FL/IPX/IPEX RF Adapter Cable](https://www.adafruit.com/product/851)<br />[Mini GSM/Cellular Quad-Band Antenna - 2dBi SMA Plug](https://www.adafruit.com/product/1859) | $9.90 |
+| Total | - | **$137.90** |
 
 All sensors chain on a single I²C bus via STEMMA QT. Only the Feathers require soldering.
 
 ---
 
-## Development
+## Software
 
-I run on NixOS and make heavy use of Nix flakes. This, plus direnv, ensures that any Nix user who clones this repo will have an identical workspace with all necessary tools. This is especially nice because you won't need to deal with Python or Conda, or polluting other environments. Everything you need will be right here.
+I run on NixOS and make heavy use of Nix flakes. This, plus direnv, ensures that any Nix user who clones this repo will have an identical workspace with all necessary tools. This is especially nice because you won't need to deal with Python or Conda, or polluting other environments. Everything you need is symlinked in .
 
 Go set up Nix, and then you can get a local dev environment by running:
 
