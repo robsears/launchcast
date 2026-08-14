@@ -45,19 +45,23 @@ if flight:
 # The label persists in the filesystem, so this only does real work on the
 # first boot after deploy. Later boots see it is already set and skip.
 
-try:
-    fs = storage.getmount("/")
-    if fs.label != LABEL:
+fs = storage.getmount("/")
+
+if fs.label != LABEL:
+    try:
         if not flight:
-            # Dev mode: briefly take write access just to set the label,
-            # then return it to the host so normal editing still works.
+            # Dev mode: briefly take write access just to set the label.
             storage.remount("/", readonly=False)
         fs.label = LABEL
-        if not flight:
-            storage.remount("/", readonly=True)
         print("boot: labeled", LABEL)
-except Exception as e:
-    print("boot: label unchanged ({})".format(e))
+    except Exception as e:
+        print("boot: label unchanged ({})".format(e))
+    finally:
+        if not flight:
+            # Always return write access to the host, even if labeling failed.
+            storage.remount("/", readonly=True)
+else:
+    print("boot: label OK ({})".format(LABEL))
 
 # --- report ------------------------------------------------------------------
 
