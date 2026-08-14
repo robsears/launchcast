@@ -167,6 +167,11 @@ class Hardware:
             self.gps = adafruit_gps.GPS_GtopI2C(self.i2c, debug=False)
             self.gps.send_command(b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0")
             self.gps.send_command(b"PMTK220,1000")
+            # SBAS/WAAS narrows single-unit error from ~5-10m to ~1-3m under open
+            # sky (No effect indoors/under tree cover). Two independent receivers
+            # still won't agree to zero -- their errors are uncorrelated.
+            self.gps.send_command(b"PMTK313,1")
+            self.gps.send_command(b"PMTK301,2")
         except Exception as e:
             self.errors.append("gps: {}".format(e))
 
