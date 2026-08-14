@@ -19,14 +19,16 @@ import storage
 
 LABEL = "LC-GROUND"
 
-try:
-    fs = storage.getmount("/")
-    if fs.label != LABEL:
+fs = storage.getmount("/")
+
+if fs.label != LABEL:
+    try:
         storage.remount("/", readonly=False)   # board-writable, briefly
         fs.label = LABEL
-        storage.remount("/", readonly=True)     # hand back to the host
         print("boot: labeled", LABEL)
-    else:
-        print("boot: label OK ({})".format(LABEL))
-except Exception as e:
-    print("boot: label unchanged ({})".format(e))
+    except Exception as e:
+        print("boot: label unchanged ({})".format(e))
+    finally:
+        storage.remount("/", readonly=True)    # always hand back to the host
+else:
+    print("boot: label OK ({})".format(LABEL))
