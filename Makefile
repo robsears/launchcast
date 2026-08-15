@@ -43,7 +43,12 @@ BAUD ?= 115200
 
 SHARED       := common/packet.py
 ROCKET_FILES := rocket/code.py rocket/boot.py $(SHARED)
-GROUND_FILES := ground/code.py ground/boot.py ground/font5x8.bin $(SHARED)
+GROUND_FILES := ground/code.py ground/boot.py ground/icons.py ground/rocket_art.py \
+                ground/handheld_art.py ground/nav.py \
+                ground/units.py ground/imu.py \
+                ground/display_util.py ground/screen_header.py ground/screen_footer.py \
+                ground/screen_flight.py ground/screen_recovery.py ground/screen_diagnostics.py \
+                ground/font5x8.bin $(SHARED)
 
 ROCKET_LIBS := adafruit_rfm9x adafruit_gps adafruit_bmp5xx \
                adafruit_lsm6ds adafruit_lis3mdl neopixel

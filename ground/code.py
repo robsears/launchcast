@@ -24,7 +24,6 @@ Copy packet.py to the board alongside this file.
 """
 
 import time
-import math
 import board
 import busio
 import digitalio
@@ -32,7 +31,13 @@ import analogio
 import keypad
 
 import packet
-from packet import State, Command, Sensor
+from packet import State, Command
+from display_util import text
+import screen_header
+import screen_footer
+import screen_flight
+import screen_recovery
+import screen_diagnostics
 
 # --- Tuning ------------------------------------------------------------------
 GPS_HZ = 1              # Local GPS refresh rate
@@ -45,8 +50,6 @@ DEBOUNCE_MS = 50        # keypad.Keys scan interval. Debounce happens in the
                         # background at this cadence regardless of what the
                         # main loop is doing, so a slow GPS/display call can't
                         # cause a press to be missed.
-
-EARTH_R_M = 6371000.0   # Radius of the Earth in m. We probably won't need to change this.
 
 CMD_CONFIRM_MS = 2000   # window to see the payload's state change after ARM/DISARM
 
@@ -222,61 +225,6 @@ class HoldTracker:
         return out
 
 
-# --- Navigation --------------------------------------------------------------
-
-
-def haversine_m(lat1, lon1, lat2, lon2):
-    """Great-circle distance in meters."""
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * EARTH_R_M * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def bearing_deg(lat1, lon1, lat2, lon2):
-    """Initial great-circle bearing, degrees true, 0-360."""
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dl = math.radians(lon2 - lon1)
-    y = math.sin(dl) * math.cos(p2)
-    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
-    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-
-
-def compass_point(deg):
-    pts = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
-    return pts[int((deg + 11.25) % 360 / 22.5)]
-
-
-def relative_arrow(bearing, heading):
-    """Turn instruction relative to the direction you are walking.
-
-    Only meaningful when moving -- GPS course over ground is undefined at
-    a standstill. Returns None if heading is unavailable.
-    """
-    if heading is None:
-        return None
-    rel = (bearing - heading + 360.0) % 360.0
-    if rel < 22.5 or rel >= 337.5:
-        return "^ AHEAD"
-    if rel < 67.5:
-        return "> 45 RIGHT"
-    if rel < 112.5:
-        return ">> RIGHT"
-    if rel < 157.5:
-        return ">> BACK RIGHT"
-    if rel < 202.5:
-        return "v TURN AROUND"
-    if rel < 247.5:
-        return "<< BACK LEFT"
-    if rel < 292.5:
-        return "<< LEFT"
-    return "< 45 LEFT"
-
-
 # --- Link state --------------------------------------------------------------
 
 
@@ -303,6 +251,7 @@ class Link:
 
         self.max_alt = 0.0
         self.max_vel = 0.0
+        self.batt_volts = 0.0
 
     def ingest(self, data, now, rssi=None, snr=None):
         tel = packet.unpack_telemetry(data)
@@ -315,6 +264,9 @@ class Link:
         self.rssi = rssi
         self.snr = snr
         self.packets += 1
+
+        if tel["batt_volts"]:
+            self.batt_volts = tel["batt_volts"]
 
         if tel["has_fix"] and tel["lat"] != 0.0:
             self.fix_lat = tel["lat"]
@@ -351,126 +303,57 @@ SCREEN_FLIGHT = 0
 SCREEN_RECOVERY = 1
 SCREEN_DIAG = 2
 SCREEN_COUNT = 3
+SCREEN_NAMES = ("FLIGHT", "RECOVERY", "DIAG")
+SCREEN_MODULES = (screen_flight, screen_recovery, screen_diagnostics)
 
 
-def draw(display, link, my_lat, my_lon, my_heading, screen, now, tx_status, my_batt):
+class Frame:
+    """Everything a screen/header/footer module might want to render,
+    computed once per draw() call so nobody recomputes link.status() etc.
+
+    screen/prev/next names are precomputed here, not looked up by the
+    header/footer modules, so MENU (screen+1) and ARM-as-back (screen-1)
+    stay in lockstep with the button dispatch in main() below -- add a
+    screen, and this is the one place that has to know about it.
+    """
+
+    def __init__(self, link, my_lat, my_lon, my_heading, my_batt, screen, now, tx_status):
+        self.link = link
+        self.my_lat = my_lat
+        self.my_lon = my_lon
+        self.my_heading = my_heading
+        self.my_batt = my_batt
+        self.screen = screen
+        self.now = now
+        self.tx_status = tx_status
+
+        self.tel = link.tel
+        self.status = link.status(now)
+        self.age = link.age_ms(now)
+        self.armed = self.tel is not None and self.tel["state"] == State.ARMED
+        self.payload_batt = self.tel["batt_volts"] if self.tel is not None else None
+
+        self.is_flight = screen == SCREEN_FLIGHT
+        self.screen_name = SCREEN_NAMES[screen]
+        self.next_screen_name = SCREEN_NAMES[(screen + 1) % SCREEN_COUNT]
+        self.prev_screen_name = SCREEN_NAMES[(screen - 1) % SCREEN_COUNT]
+
+
+def draw(display, frame):
     """Render one frame. Sharp Memory: 0 = dark pixel, 1 = light."""
     if display is None:
         return
 
     display.fill(1)
+    screen_header.draw(display, frame)
 
-    def text(x, y, s, size=1):
-        try:
-            display.text(s, x, y, 0, size=size)
-        except TypeError:
-            display.text(s, x, y, 0)
+    if frame.tel is None:
+        text(display, 4, 90, "NO TELEMETRY", size=3)
+        text(display, 4, 130, "rejects: {}".format(frame.link.rejects))
+    else:
+        SCREEN_MODULES[frame.screen].draw(display, frame)
 
-    status = link.status(now)
-    age = link.age_ms(now)
-    tel = link.tel
-
-    # -- header, on every screen ---------------------------------------------
-    text(4, 4, "LAUNCHCAST", 2)
-    text(250, 4, status, 2)
-    if age is not None:
-        text(250, 26, "{:.1f}s ago".format(age / 1000.0))
-    text(4, 26, ("FLIGHT", "RECOVERY", "DIAG")[screen])
-
-    if tel is None:
-        text(4, 90, "NO TELEMETRY", 3)
-        text(4, 130, "rejects: {}".format(link.rejects))
-        display.show()
-        return
-
-    if screen == SCREEN_FLIGHT:
-        # ----- PAYLOAD (left column) -----
-        text(4, 50, tel["state_name"], 3)
-        text(4, 88,  "ALT {:>7.1f}m".format(tel["alt_baro_m"]), 2)
-        text(4, 110, "TMP {:>6.1f}C".format(tel["temp_c"]), 2)
-        text(4, 132, "ACC {:.2f} {:.2f} {:.2f}".format(*tel["accel_g"]), 1)
-        text(4, 148, "BAT {:.2f}V".format(tel["batt_volts"]), 2)
-
-        present, missing = Sensor.decode(tel["sensors"])
-        text(4, 172, "UP {}".format(" ".join(present)), 1)
-        if missing:
-            text(4, 186, "DN {}".format(" ".join(missing)), 1)
-
-        if tel["has_fix"]:
-            text(4, 204, "{:.5f} {:.5f}".format(tel["lat"], tel["lon"]), 1)
-            text(4, 218, "SAT {}".format(tel["satellites"]), 1)
-        else:
-            text(4, 204, "payload GPS: no fix", 1)
-
-        # ----- HANDHELD + LINK (right column) -----
-        rx = 210
-        text(rx, 50, status, 2)
-        if age is not None:
-            text(rx, 72, "AGE {:.1f}s".format(age / 1000.0), 1)
-        text(rx, 88,  "RSSI {}".format(link.rssi if link.rssi is not None else "--"), 1)
-        text(rx, 102, "SNR  {}".format(link.snr if link.snr is not None else "--"), 1)
-        text(rx, 116, "PKT {} REJ {}".format(link.packets, link.rejects), 1)
-        if my_batt is not None:
-            text(rx, 134, "HH BAT {:.2f}V".format(my_batt), 1)
-
-        # distance to rocket, if both have a fix
-        if link.fix_lat is not None and my_lat is not None:
-            d = haversine_m(my_lat, my_lon, link.fix_lat, link.fix_lon)
-            b = bearing_deg(my_lat, my_lon, link.fix_lat, link.fix_lon)
-            text(rx, 156, "DIST {:.0f}m".format(d), 2)
-            text(rx, 178, "BRG {:.0f} {}".format(b, compass_point(b)), 1)
-        elif link.fix_lat is not None:
-            text(rx, 156, "rocket seen,", 1)
-            text(rx, 170, "need own fix", 1)
-        else:
-            text(rx, 156, "no rocket fix", 1)
-
-        # ----- alerts / command status (bottom, full width) -----
-        if tel["batt_volts"] < 3.80:
-            text(4, 232, "*** PAYLOAD BATT LOW -- NO GO ***", 1)
-        else:
-            text(rx, 200, tx_status, 1)
-
-    elif screen == SCREEN_RECOVERY:
-        if link.fix_lat is None:
-            text(4, 90, "NO FIX LATCHED", 2)
-            text(4, 120, "walk toward last seen bearing")
-        elif my_lat is None:
-            text(4, 60, "ROCKET", 2)
-            text(4, 84, "{:.6f}".format(link.fix_lat), 2)
-            text(4, 108, "{:.6f}".format(link.fix_lon), 2)
-            text(4, 140, "waiting for own GPS fix")
-        else:
-            d = haversine_m(my_lat, my_lon, link.fix_lat, link.fix_lon)
-            b = bearing_deg(my_lat, my_lon, link.fix_lat, link.fix_lon)
-            text(4, 52, "{:.0f} m".format(d), 3)
-            text(180, 52, "{:.0f} {}".format(b, compass_point(b)), 3)
-
-            arrow = relative_arrow(b, my_heading)
-            if arrow:
-                text(4, 100, arrow, 3)
-            else:
-                text(4, 100, "walk to get heading", 2)
-
-            text(4, 150, "rocket {:.6f}".format(link.fix_lat))
-            text(4, 166, "       {:.6f}".format(link.fix_lon))
-            fix_age = (now - link.fix_age_ms) / 1000.0
-            text(4, 190, "fix age {:.0f}s".format(fix_age))
-            if status != "LIVE":
-                text(200, 190, "LATCHED -- rocket silent")
-
-    else:  # SCREEN_DIAG
-        text(4, 52, "pkts {}  rej {}".format(link.packets, link.rejects))
-        text(4, 72, "rssi {}  snr {}".format(link.rssi, link.snr))
-        text(4, 92, "state {}".format(tel["state_name"]))
-        text(4, 112, "uptime {:.1f}s".format(tel["uptime_ms"] / 1000.0))
-        text(4, 132, "counter {}".format(tel["counter"]))
-        present, missing = Sensor.decode(tel["sensors"])
-        text(4, 152, "up: {}".format(" ".join(present)))
-        text(4, 168, "down: {}".format(" ".join(missing) or "none"))
-        text(4, 192, "accel {:.2f} {:.2f} {:.2f}".format(*tel["accel_g"]))
-        text(4, 208, tx_status)
-
+    screen_footer.draw(display, frame)
     display.show()
 
 
@@ -579,16 +462,21 @@ def main():
                     tx_status = "CHIRP sent"
 
                 elif name == "arm" and event == "hold":
-                    armed = link.tel is not None and link.tel["state"] == State.ARMED
-                    seq += 1
-                    if armed:
-                        _send(hw, packet.pack_command(seq, Command.DISARM))
-                        pending = {"want": State.IDLE, "sent_ms": now, "seq": seq}
-                        tx_status = "DISARM sent..."
+                    if screen != SCREEN_FLIGHT:
+                        # Off the FLIGHT screen, ARM/DISARM is repurposed as
+                        # BACK -- the command can only be sent from FLIGHT.
+                        screen = (screen - 1) % SCREEN_COUNT
                     else:
-                        _send(hw, packet.pack_command(seq, Command.ARM))
-                        pending = {"want": State.ARMED, "sent_ms": now, "seq": seq}
-                        tx_status = "ARM sent..."
+                        armed = link.tel is not None and link.tel["state"] == State.ARMED
+                        seq += 1
+                        if armed:
+                            _send(hw, packet.pack_command(seq, Command.DISARM))
+                            pending = {"want": State.IDLE, "sent_ms": now, "seq": seq}
+                            tx_status = "DISARM sent..."
+                        else:
+                            _send(hw, packet.pack_command(seq, Command.ARM))
+                            pending = {"want": State.ARMED, "sent_ms": now, "seq": seq}
+                            tx_status = "ARM sent..."
             except Exception as e:
                 tx_status = "button handler failed"
                 print("button handler exception:", e)
@@ -608,8 +496,9 @@ def main():
             next_draw = now + draw_period
             t0 = ms()
             try:
-                draw(hw.display, link, my_lat, my_lon, my_heading,
-                     screen, now, tx_status, my_batt)
+                frame = Frame(link, my_lat, my_lon, my_heading, my_batt,
+                               screen, now, tx_status)
+                draw(hw.display, frame)
             except Exception as e:
                 print("draw failed:", e)
             dt = ms() - t0
@@ -625,12 +514,12 @@ def main():
             print("SLOW LOOP:", loop_dt, "ms")
 
 
-def _send(hw, frame):
+def _send(hw, pkt):
     """Transmit and return to receive. Half-duplex: TX blocks RX briefly."""
     if not hw.radio:
         return
     try:
-        hw.radio.send(frame)
+        hw.radio.send(pkt)
     except Exception as e:
         print("send failed:", e)
 
