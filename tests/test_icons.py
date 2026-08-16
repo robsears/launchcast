@@ -8,11 +8,14 @@ display that just records the calls it received.
 """
 
 from ground.icons import (
+    BATT_CURVE,
+    BOLT_BITMAP,
     SIGNAL_BARS,
     battery_level,
     battery_percent,
     draw_battery,
     draw_bitmap,
+    draw_bolt,
     signal_level,
     signal_percent,
 )
@@ -61,24 +64,47 @@ def test_signal_bars_defined_for_every_level():
         assert all(len(row) == 8 for row in rows)
 
 
-# --- battery_level ---------------------------------------------------------
+# --- battery_percent / battery_level ----------------------------------------
+
+
+def test_battery_percent_none_is_zero():
+    assert battery_percent(None) == 0
+
+
+def test_battery_percent_matches_curve_anchors_exactly():
+    for volts, pct in BATT_CURVE:
+        assert battery_percent(volts) == pct
+
+
+def test_battery_percent_clamps_outside_the_curve():
+    assert battery_percent(5.0) == 100   # above the top anchor
+    assert battery_percent(3.0) == 0     # below the bottom anchor
+
+
+def test_battery_percent_interpolates_between_anchors():
+    # Halfway between 3.78V/50% and 3.82V/60% -> 55%. This is exactly the
+    # kind of reading the old 4-bucket scheme collapsed into one bucket.
+    assert battery_percent(3.80) == 55
+
+
+def test_battery_percent_is_monotonic_with_voltage():
+    volts = sorted(v for v, _ in BATT_CURVE)
+    percents = [battery_percent(v) for v in volts]
+    assert percents == sorted(percents)
 
 
 def test_battery_level_none_is_zero():
     assert battery_level(None) == 0
 
 
-def test_battery_level_buckets():
+def test_battery_level_caps_at_4():
     assert battery_level(4.20) == 4
-    assert battery_level(4.05) == 4
-    assert battery_level(4.04) == 3
-    assert battery_level(3.95) == 3
-    assert battery_level(3.94) == 2
-    assert battery_level(3.80) == 2
-    assert battery_level(3.79) == 1
-    assert battery_level(3.65) == 1
-    assert battery_level(3.64) == 0
-    assert battery_level(3.30) == 0
+    assert battery_level(100.0) == 4  # pathological input, still clamps
+
+
+def test_battery_level_is_percent_over_25_capped():
+    for volts in (4.20, 4.00, 3.90, 3.80, 3.68, 3.50, 3.30):
+        assert battery_level(volts) == min(4, battery_percent(volts) // 25)
 
 
 def test_signal_percent_matches_level_times_25():
@@ -86,9 +112,18 @@ def test_signal_percent_matches_level_times_25():
         assert signal_percent(rssi) == signal_level(rssi) * 25
 
 
-def test_battery_percent_matches_level_times_25():
-    for volts in (None, 4.20, 3.98, 3.85, 3.70, 3.30):
-        assert battery_percent(volts) == battery_level(volts) * 25
+# --- draw_bolt -----------------------------------------------------------
+
+
+def test_bolt_bitmap_is_rectangular():
+    width = len(BOLT_BITMAP[0])
+    assert all(len(row) == width for row in BOLT_BITMAP)
+
+
+def test_draw_bolt_places_pixels():
+    display = FakeDisplay()
+    draw_bolt(display, 0, 0)
+    assert len(display.pixels) > 0
 
 
 # --- draw_bitmap -------------------------------------------------------------

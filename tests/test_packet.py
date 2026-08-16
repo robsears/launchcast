@@ -234,6 +234,24 @@ def test_sensor_flags_survive_the_wire():
     assert out["sensors"] == flags
 
 
+def test_chg_is_excluded_from_names_all_and_required():
+    # CHG is a live power state (USB present), not a peripheral health flag --
+    # it must not show up as a "missing sensor" mid-flight when USB is
+    # (normally, correctly) unplugged.
+    names_bits = [bit for bit, _ in Sensor.NAMES]
+    assert Sensor.CHG not in names_bits
+    assert not (Sensor.ALL & Sensor.CHG)
+    assert not (Sensor.REQUIRED & Sensor.CHG)
+    assert Sensor.flight_ready(Sensor.ALL)  # unaffected by CHG being unset
+
+
+def test_chg_bit_survives_the_wire_alongside_others():
+    flags = Sensor.BARO | Sensor.IMU | Sensor.LOG | Sensor.CHG
+    out = packet.unpack_telemetry(packet.pack_telemetry(**_sample(sensors=flags)))
+    assert out["sensors"] & Sensor.CHG
+    assert out["sensors"] == flags
+
+
 # --- State names -------------------------------------------------------------
 
 

@@ -10,8 +10,10 @@ Runs on an Adafruit Feather RP2040 RFM95 (PID 5714) with:
 Design contract:
   - The downlink is a MONITOR. The flash log is the DATASET. Radio packets
     drop; flash does not. Never let a radio failure stall the log loop.
-  - Loop order is: sense -> log -> state -> radio. Sensing and logging are
-    never skipped. Radio work is best-effort and time-boxed.
+  - Loop order is: sense -> log -> state -> radio. Sensing is never skipped;
+    radio work is best-effort and time-boxed. Logging itself only runs from
+    ARMED onward -- BOOT/IDLE can sit on a bench or pad for hours across dev
+    sessions and would otherwise fill the flash with nothing useful.
   - Apogee is detected from BAROMETRIC VELOCITY, not acceleration.
     Acceleration is ~1 g through the entire coast/descent transition.
 
@@ -27,6 +29,7 @@ import digitalio
 import pwmio
 import analogio
 import microcontroller
+import supervisor
 
 import packet
 from packet import State, Command, Sensor
@@ -419,6 +422,25 @@ class FlightLog:
         except Exception:
             self.enabled = False
 
+    def clear(self):
+        """Truncate the log and drop any unflushed records.
+
+        Called when a bench ARM is disarmed without ever reaching BOOST --
+        that arm cycle produced no flight data worth keeping, and bench
+        ARM/DISARM cycles are frequent enough during dev to otherwise refill
+        the flash the same way idle bench time used to.
+        """
+        if not self.enabled:
+            return
+        try:
+            with open(self.path, "wb"):
+                pass
+            self.buf = bytearray()
+            self.records = 0
+            self.dropped = 0
+        except Exception:
+            self.enabled = False
+
 
 # --- Main --------------------------------------------------------------------
 
@@ -520,8 +542,12 @@ def main():
                 except Exception:
                     pass
 
-        # -- log: every IMU sample, regardless of anything else ---------------
-        log.write(now, fs.state, fs.alt_m, fs.vel_mps, pressure, temp_c, accel, gyro)
+        # -- log: every IMU sample from ARMED onward, regardless of anything
+        # else. BOOT/IDLE are excluded -- unlike a real flight, they can last
+        # indefinitely (bench testing, sitting on the pad waiting), and would
+        # otherwise fill the flash with nothing useful before liftoff.
+        if fs.state not in (State.BOOT, State.IDLE):
+            log.write(now, fs.state, fs.alt_m, fs.vel_mps, pressure, temp_c, accel, gyro)
 
         # -- state machine ----------------------------------------------------
         if fs.update(accel_g, now):
@@ -578,7 +604,12 @@ def main():
                         elif cmd == Command.DISARM and fs.state == State.ARMED:
                             fs.transition(State.IDLE, now)
                             hw.set_pixel(PIXEL_FOR_STATE[State.IDLE])
-                            print("DISARMED")
+                            # ARMED -> IDLE only happens via an explicit DISARM
+                            # while still ARMED -- BOOST is never detected, so
+                            # this arm cycle logged nothing worth keeping.
+                            # A real flight never takes this path back to IDLE.
+                            log.clear()
+                            print("DISARMED (log cleared)")
                         elif cmd == Command.CHIRP:
                             chirp_until = now + CHIRP_MS
 
@@ -619,7 +650,7 @@ def main():
                 batt_volts=batt,
                 has_fix=has_fix,
                 satellites=sats,
-                sensors=sensors,
+                sensors=sensors | (Sensor.CHG if supervisor.runtime.usb_connected else 0),
             )
             counter += 1
             try:

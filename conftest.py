@@ -1,9 +1,12 @@
 """Stub out CircuitPython hardware modules so firmware imports under CPython.
 
 The flight firmware imports `board`, `busio`, `digitalio`, `pwmio`, `analogio`,
-`neopixel`, and `microcontroller` at module scope. None exist off-board. These
-stubs let the pure-logic classes -- FlightState in particular -- be imported and
-tested without hardware.
+`neopixel`, `microcontroller`, and `supervisor` at module scope. None exist
+off-board. These stubs let the pure-logic classes -- FlightState in
+particular -- be imported and tested without hardware. Hardware-coupled
+ground station code (ground/code.py) is not imported directly by tests at
+all -- see the note below about why not, and ground/icons.py, ground/
+hold_tracker.py for the pattern used instead to keep its logic testable.
 
 Nothing here simulates hardware behavior. Any test that would need a real
 peripheral belongs on the bench, not in CI.
@@ -16,6 +19,14 @@ import os
 # The board has a flat filesystem: code.py and packet.py sit side by side,
 # so the firmware does `import packet`. Make that resolve in CI too, rather
 # than rewriting imports at deploy time.
+#
+# ground/ is deliberately NOT added here the same way: its entry point is
+# also named code.py, which would shadow the stdlib `code` module (used by
+# pdb) for the whole pytest session the moment it's added to sys.path --
+# that's a real footgun, not a hypothetical one, first hit while wiring up
+# HoldTracker tests. ground/code.py's own pieces get tested by extracting
+# hardware-free logic into its own module (see icons.py) rather than
+# importing ground/code.py itself.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "common"))
 
 
@@ -100,6 +111,8 @@ def _install():
     _stub("neopixel", NeoPixel=_NeoPixel, GRB="GRB", RGB="RGB")
 
     _stub("microcontroller", reset=lambda: None)
+
+    _stub("supervisor", runtime=types.SimpleNamespace(usb_connected=False))
 
 
 _install()

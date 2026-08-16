@@ -24,15 +24,18 @@ Copy packet.py to the board alongside this file.
 """
 
 import time
+import gc
 import board
 import busio
 import digitalio
 import analogio
 import keypad
+import supervisor
 
 import packet
-from packet import State, Command
+from packet import State, Command, Sensor
 from display_util import text
+from hold_tracker import HoldTracker
 import screen_header
 import screen_footer
 import screen_flight
@@ -50,11 +53,31 @@ DEBOUNCE_MS = 50        # keypad.Keys scan interval. Debounce happens in the
                         # background at this cadence regardless of what the
                         # main loop is doing, so a slow GPS/display call can't
                         # cause a press to be missed.
+GRACE_MS = 250          # HoldTracker bridges a release-then-re-press of the
+                        # same key within this window, so a brief mechanical
+                        # bounce mid-hold doesn't restart HOLD_MS or misfire
+                        # as a tap. Adds the same delay to genuine tap
+                        # dispatch (it now finalizes GRACE_MS after release
+                        # instead of immediately) -- should be imperceptible
+                        # for a physical button, but lower it if CHIRP starts
+                        # feeling laggy.
 
-CMD_CONFIRM_MS = 2000   # window to see the payload's state change after ARM/DISARM
+CMD_CONFIRM_FRAMES = 3  # payload telemetry frames to see before declaring an
+                        # ARM/DISARM failed. Counting frames rather than
+                        # elapsed time follows the payload's own TX rate
+                        # (TX_HZ_IDLE/TX_HZ_FLIGHT), so the window is neither
+                        # too short at low rate nor needlessly long at high
+                        # rate. A link-lost fallback below still applies when
+                        # no frames are arriving at all to count.
 
 BATT_DIVIDER = 2.0      # Onboard voltage divider ratio; 1.0 if reading BAT directly
 BATT_SAMPLES = 8        # Number of samples to average for estimating battery life
+
+# Below this, treat "USB connected" as USB-power-only, not charging -- the
+# BAT rail reads low/unstable with no cell attached (e.g. slide switch left
+# open), and we don't want that showing up as a false CHARGING indicator.
+# Verify empirically on real hardware (switch open + USB in) and adjust.
+BATT_PRESENT_MIN_V = 2.5
 
 # --- Display --------------------------------------------------------
 
@@ -177,52 +200,8 @@ class Hardware:
 
 
 # --- Buttons -----------------------------------------------------------------
-
-
-class HoldTracker:
-    """Turns keypad.Keys press/release edges into 'tap' / 'hold' events.
-
-    keypad.Keys debounces and timestamps presses in the background (a
-    supervisor-level scan, not the Python main loop), so an edge is never
-    missed just because the loop is stuck in a slow GPS or display call. This
-    class only adds the piece keypad.Keys doesn't have: "still held after
-    HOLD_MS" isn't an edge, so it has to be checked every pass rather than
-    read off the event queue.
-
-    A tap fires on RELEASE, so a hold does not also register as a tap.
-    """
-
-    def __init__(self, names):
-        self.names = names  # index (key_number) -> name
-        self.down_since = {}     # name -> ms timestamp, present only while held
-        self.hold_fired = set()
-
-    def poll(self, keys, now):
-        """Drain queued edges and check for newly-expired holds.
-
-        Returns a list of (name, 'tap' | 'hold') pairs, in order.
-        """
-        out = []
-        while True:
-            event = keys.events.get()
-            if event is None:
-                break
-            name = self.names[event.key_number]
-            if event.pressed:
-                self.down_since[name] = now
-                self.hold_fired.discard(name)
-            else:
-                since = self.down_since.pop(name, None)
-                if since is not None and name not in self.hold_fired:
-                    out.append((name, "tap"))
-                self.hold_fired.discard(name)
-
-        for name, since in self.down_since.items():
-            if name not in self.hold_fired and now - since >= HOLD_MS:
-                self.hold_fired.add(name)
-                out.append((name, "hold"))
-
-        return out
+# HoldTracker itself lives in hold_tracker.py -- it has no hardware imports,
+# so it can be unit tested off-board (see tests/test_hold_tracker.py).
 
 
 # --- Link state --------------------------------------------------------------
@@ -317,12 +296,14 @@ class Frame:
     screen, and this is the one place that has to know about it.
     """
 
-    def __init__(self, link, my_lat, my_lon, my_heading, my_batt, screen, now, tx_status):
+    def __init__(self, link, my_lat, my_lon, my_heading, my_batt, my_charging,
+                 screen, now, tx_status):
         self.link = link
         self.my_lat = my_lat
         self.my_lon = my_lon
         self.my_heading = my_heading
         self.my_batt = my_batt
+        self.my_charging = my_charging
         self.screen = screen
         self.now = now
         self.tx_status = tx_status
@@ -332,6 +313,9 @@ class Frame:
         self.age = link.age_ms(now)
         self.armed = self.tel is not None and self.tel["state"] == State.ARMED
         self.payload_batt = self.tel["batt_volts"] if self.tel is not None else None
+        self.payload_charging = (
+            self.tel is not None and bool(self.tel["sensors"] & Sensor.CHG)
+        )
 
         self.is_flight = screen == SCREEN_FLIGHT
         self.screen_name = SCREEN_NAMES[screen]
@@ -371,22 +355,24 @@ def main():
         print("INIT FAIL:", err)
 
     link = Link()
-    held = HoldTracker(BUTTON_NAMES)
+    held = HoldTracker(BUTTON_NAMES, hold_ms=HOLD_MS, grace_ms=GRACE_MS)
 
     screen = SCREEN_FLIGHT
     seq = 0
     tx_status = "ready"
     # Pending ARM/DISARM awaiting confirmation from the payload's reported state.
-    pending = None          # dict: {"want": State.ARMED/IDLE, "sent_ms": t, "seq": n}
+    pending = None          # dict: {"want": State.ARMED/IDLE, "packets_at_send": n, "seq": n}
 
     my_lat = None
     my_lon = None
     my_heading = None
     my_batt = None
+    my_charging = False
 
     next_draw = 0
     next_gps = 0
     next_vbat = 0
+    next_memcheck = 0
     draw_period = int(1000 / DISPLAY_HZ)
     gps_period = int(1000 / GPS_HZ)
     vbat_period = 2000 # check battery every 2s
@@ -441,6 +427,15 @@ def main():
             except Exception:
                 pass
 
+        try:
+            my_charging = (
+                supervisor.runtime.usb_connected
+                and my_batt is not None
+                and my_batt >= BATT_PRESENT_MIN_V
+            )
+        except Exception:
+            my_charging = False
+
         # -- buttons ----------------------------------------------------------
         # keypad.Keys captured and debounced any edges in the background --
         # this just drains them, so it can't be starved by a slow GPS/display
@@ -452,6 +447,7 @@ def main():
             print("button poll exception:", e)
 
         for name, event in events:
+            print("BUTTON EVENT:", name, event)
             try:
                 if name == "menu" and event == "tap":
                     screen = (screen + 1) % SCREEN_COUNT
@@ -471,11 +467,11 @@ def main():
                         seq += 1
                         if armed:
                             _send(hw, packet.pack_command(seq, Command.DISARM))
-                            pending = {"want": State.IDLE, "sent_ms": now, "seq": seq}
+                            pending = {"want": State.IDLE, "packets_at_send": link.packets, "seq": seq}
                             tx_status = "DISARM sent..."
                         else:
                             _send(hw, packet.pack_command(seq, Command.ARM))
-                            pending = {"want": State.ARMED, "sent_ms": now, "seq": seq}
+                            pending = {"want": State.ARMED, "packets_at_send": link.packets, "seq": seq}
                             tx_status = "ARM sent..."
             except Exception as e:
                 tx_status = "button handler failed"
@@ -487,8 +483,14 @@ def main():
             if cur == pending["want"]:
                 tx_status = "ARMED OK" if pending["want"] == State.ARMED else "DISARMED OK"
                 pending = None
-            elif now - pending["sent_ms"] > CMD_CONFIRM_MS:
+            elif link.packets - pending["packets_at_send"] >= CMD_CONFIRM_FRAMES:
                 tx_status = "!! COMMAND FAILED -- retry"
+                pending = None
+            elif link.status(now) == "LOST":
+                # The check above can't fire if no frames are arriving at all
+                # to count -- don't leave a stale "...sent" status up forever
+                # if the link itself has dropped.
+                tx_status = "!! COMMAND FAILED -- link lost"
                 pending = None
 
         # -- display, on a timer (also services VCOM) -------------------------
@@ -496,14 +498,30 @@ def main():
             next_draw = now + draw_period
             t0 = ms()
             try:
-                frame = Frame(link, my_lat, my_lon, my_heading, my_batt,
+                frame = Frame(link, my_lat, my_lon, my_heading, my_batt, my_charging,
                                screen, now, tx_status)
                 draw(hw.display, frame)
             except Exception as e:
                 print("draw failed:", e)
+            # Frame/draw() churn out several short-lived strings and dicts a
+            # cycle. CircuitPython's collector doesn't compact the heap, so
+            # that garbage fragments it over time until even a small
+            # contiguous allocation (the display's own buffer, a formatted
+            # string) can fail despite plenty of free memory in aggregate.
+            # Collecting right after the allocation-heavy part of the loop
+            # coalesces adjacent free blocks before they have a chance to
+            # fragment further.
+            gc.collect()
             dt = ms() - t0
             if dt > 50:
                 print("DRAW TOOK", dt, "ms")
+
+        # -- memory watchdog ----------------------------------------------------
+        if now >= next_memcheck:
+            next_memcheck = now + 5000
+            free = gc.mem_free()
+            if free < 20000:
+                print("LOW MEMORY:", free, "bytes free")
 
         # -- loop-latency watchdog ---------------------------------------------
         # Buttons are only sampled once per pass through this loop, so any

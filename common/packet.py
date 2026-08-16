@@ -264,7 +264,12 @@ class Sensor:
     GPS   = 0x08   # PA1010D
     LOG   = 0x10   # filesystem writable; flight log is recording
     BATT  = 0x20   # battery ADC readable
+    CHG   = 0x40   # USB power present (charging or charged)
 
+    # CHG is deliberately left out of NAMES/ALL/REQUIRED: it's a live power
+    # state, not a peripheral health flag, and it's normally 0 for the
+    # entire flight (USB unplugged). Mixing it into Sensor.decode()'s
+    # present/missing lists would make every flight show a "missing sensor".
     NAMES = (
         (BARO, "BARO"),
         (IMU,  "IMU"),

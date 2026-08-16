@@ -27,12 +27,16 @@ def draw(display, frame):
     icons.draw_rocket(display,  rocket_x,      4, scale=1)
     icons.draw_signal(display,  rocket_signal, 4, frame.link.rssi, scale=SIGNAL_SCALE)
     icons.draw_battery(display, rocket_batt,   4, frame.payload_batt)
+    if frame.payload_charging:
+        icons.draw_bolt(display, rocket_batt + icons.BATT_W + 2, 4)
 
     # handheld's own battery -- separate from the rocket cluster above, or
     # it silently overwrites the one reading we have for the ground unit.
     icons.draw_ground(display, 315,   4, scale=1)
     text(display, 330, 4, "HH")
     icons.draw_battery(display, 330, 14, frame.my_batt)
+    if frame.my_charging:
+        icons.draw_bolt(display, 330 + icons.BATT_W + 2, 14)
 
     # text(display, 230, 4, frame.status, size=2)
     # if frame.age is not None:

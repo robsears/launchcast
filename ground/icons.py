@@ -134,19 +134,49 @@ def signal_percent(rssi):
 
 BATT_W, BATT_H = 20, 10
 
-# Handwaved 1S LiPo rest-voltage bands. These packs don't discharge
-# linearly, so this is "close enough to fly by," not a fuel gauge.
-BATT_THRESHOLDS = (4.05, 3.95, 3.80, 3.65)  # volts at/above -> level 4..1; below all -> 0
+# 1S LiPo rest-voltage discharge curve, highest voltage first. LiPo voltage
+# sags fast in the last ~20% and stays nearly flat across the top ~30%, so a
+# straight-line (or 4-bucket) volts-to-percent mapping put a 95%-charged pack
+# and a 75%-charged pack in the same bucket. Interpolated linearly between
+# these anchor points instead. The 3.30 V/0% anchor is an assumed empty-pack
+# cutoff (not one of the measured points) -- adjust if flight data disagrees.
+BATT_CURVE = (
+    (4.20, 100),
+    (4.18, 95),
+    (4.10, 90),
+    (4.05, 85),
+    (4.00, 80),
+    (3.95, 75),
+    (3.90, 70),
+    (3.85, 65),
+    (3.82, 60),
+    (3.78, 50),
+    (3.72, 40),
+    (3.68, 30),
+    (3.60, 20),
+    (3.50, 10),
+    (3.30, 0),
+)
+
+
+def battery_percent(volts):
+    """Interpolate a rest voltage onto the discharge curve. None -> 0."""
+    if volts is None:
+        return 0
+    if volts >= BATT_CURVE[0][0]:
+        return BATT_CURVE[0][1]
+    if volts <= BATT_CURVE[-1][0]:
+        return BATT_CURVE[-1][1]
+    for (v_hi, p_hi), (v_lo, p_lo) in zip(BATT_CURVE, BATT_CURVE[1:]):
+        if volts >= v_lo:
+            frac = (volts - v_lo) / (v_hi - v_lo)
+            return round(p_lo + frac * (p_hi - p_lo))
+    return 0  # unreachable -- range is fully covered by the checks above
 
 
 def battery_level(volts):
-    """Bucket a battery voltage into a 0-4 fill level. None -> 0."""
-    if volts is None:
-        return 0
-    for i, threshold in enumerate(BATT_THRESHOLDS):
-        if volts >= threshold:
-            return 4 - i
-    return 0
+    """Bucket battery percent into a 0-4 fill level for the bar icon."""
+    return min(4, battery_percent(volts) // 25)
 
 
 def draw_battery(display, x, y, volts, color=0):
@@ -158,6 +188,23 @@ def draw_battery(display, x, y, volts, color=0):
         display.fill_rect(x + 2 + i * seg_w, y + 2, seg_w - 1, BATT_H - 4, color)
 
 
-def battery_percent(volts):
-    """Same 0-4 bucket as the bar icon, just as a percentage for tables/text."""
-    return battery_level(volts) * 25
+# --- Charging bolt ------------------------------------------------------------
+
+BOLT_W, BOLT_H = 6, 10
+
+BOLT_BITMAP = (
+    "001100",
+    "001100",
+    "011000",
+    "011000",
+    "111111",
+    "001110",
+    "000110",
+    "001100",
+    "001100",
+    "011000",
+)
+
+
+def draw_bolt(display, x, y, scale=1):
+    draw_bitmap(display, x, y, BOLT_BITMAP, scale=scale)

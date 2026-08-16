@@ -48,7 +48,9 @@ def draw(display, frame):
         units.temperature(tel["temp_c"]), units.temperature_label()))
     text(display, TABLE_X, 150, "ALTITUDE:        {:.1f}{}".format(
         units.distance(tel["alt_baro_m"]), units.distance_label()))
-    text(display, TABLE_X, 162, "BATTERY:         {}%".format(icons.battery_percent(tel["batt_volts"])))
+    text(display, TABLE_X, 162, "BATTERY:         {}%{}".format(
+        icons.battery_percent(tel["batt_volts"]),
+        " CHG" if tel["sensors"] & Sensor.CHG else ""))
     text(display, TABLE_X, 174, "SIGNAL STRENGTH: {}%".format(icons.signal_percent(link.rssi)))
     text(display, TABLE_X, 186, "STATUS:          {}".format(tel["state_name"]))
 
@@ -58,7 +60,9 @@ def draw(display, frame):
     text(display, RX, MC_TABLE_Y, "CONTROLLER", size=2)
     text(display, RX, MC_TABLE_Y + 21, "GPS LOCK: {}".format(
         "FIXED" if frame.my_lat is not None else "SEARCH"))
-    text(display, RX, MC_TABLE_Y + 33, "BATTERY:  {}%".format(icons.battery_percent(frame.my_batt)))
+    text(display, RX, MC_TABLE_Y + 33, "BATTERY:  {}%{}".format(
+        icons.battery_percent(frame.my_batt),
+        " CHG" if frame.my_charging else ""))
 
     if link.fix_lat is not None and frame.my_lat is not None:
         d = haversine_m(frame.my_lat, frame.my_lon, link.fix_lat, link.fix_lon)
