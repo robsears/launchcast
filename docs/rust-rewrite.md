@@ -555,10 +555,230 @@ half-built systems against each other.
   `common::Sensor::present`/`missing`.
 
 Builds and clippy-checks clean on host (133 tests passing) and
-`thumbv6m-none-eabi`. **None of this has been flashed/tested on real
-hardware yet** -- GPS fix acquisition, battery readings, and the
-MENU/ARM screen-cycling dispatch are all unverified against actual
-hardware.
+`thumbv6m-none-eabi`. **Flashed and confirmed working on the real ground
+unit (2026-08-17)**: buttons noticeably more responsive than the
+CircuitPython version, ARM/DISARM hold-to-arm confirmed over the real
+radio link, CHIRP confirmed, screen cycling confirmed fast. GPS fix
+acquisition on the handheld itself hasn't been separately confirmed
+(DIST still reads `--`, but that's expected without an outdoor sky view,
+not necessarily a bug).
+
+### 2026-08-17/18 -- post-flash polish pass
+
+User feedback after the above hardware confirmation, worked through as a
+punch list:
+- **Battery percent formula replaced** (`ground-logic/src/icons.rs`): the
+  old 15-anchor piecewise-linear `BATT_CURVE` table is gone, replaced by a
+  user-provided sigmoid, `123 * (1 - 1/((1 + (V/3.7)^80)^0.165))` --
+  motivated by an observed real 4.1V->5.0V jump (battery reaching full
+  charge, Feather switching to USB power) that the old table represented
+  poorly. The new formula's own saturation behavior clamps any
+  above-4.2V reading to 100% without a special case.
+- **ALTITUDE shows "N/A" during BOOT/IDLE** (`ground/src/screen_flight.rs`):
+  previously showed a frozen, meaningless ~0 before ARM captures the
+  ground-pressure reference -- now reads as "not applicable yet"
+  instead of "looks broken."
+- **Off-FLIGHT ARM/DISARM button is a tap-to-go-back, not a hold**
+  (`ground/src/main.rs`'s `button_task`): the 2s hold is still required
+  to actually arm/disarm from FLIGHT, but on RECOVERY/DIAG the same
+  button now navigates back on a single tap, matching MENU's tap-to-
+  advance. Still filtered and handled entirely on core1, same reasoning
+  as the original MENU/ARM-as-BACK redesign -- core0 never sees a press
+  that isn't a genuine "send the command."
+- **ARM/DISARM pending-confirmation + a command log panel**
+  (`ground/src/cmdlog.rs`, new module): ports `code.py`'s
+  `tx_status`/`pending`/`CMD_CONFIRM_FRAMES` state machine, resolving a
+  sent ARM/DISARM to "ARMED OK"/"DISARMED OK"/"CMD FAILED -- retry"/"CMD
+  FAILED -- link lost" by watching `radio::PACKET_COUNT` and
+  `LinkStatus::Lost`, same as the Python original. Owned by core0 (the
+  side that sends commands and sees the packet counter/link state),
+  read by core1's display task through a `Mutex`-guarded snapshot
+  (`CmdLogSnapshot`, cloned out rather than held across a render -- same
+  pattern as `link::LINK`). Rendered as a 3-line scrolling log on the
+  FLIGHT screen (`screen_flight.rs`) under the CONTROLLER panel, which
+  was shifted up (handheld art now starts at y=40, the top bound
+  screens are allowed to draw at, instead of y=44) to make room without
+  moving the bottom status/alert line.
+- **Themed MISSING screen, and it now also covers "gone stale mid-flight,"
+  not just "before the first frame"** (`ground/src/screen_missing.rs`,
+  `ground/src/missing_art.rs`, `ground-logic/src/link.rs`'s new
+  `telemetry_missing`/`TELEMETRY_MISSING_MS`): replaces the plain "NO
+  TELEMETRY" text fallback with a magnifying-glass glyph (user-supplied
+  `docs/images/rocket-missing.png`, already 85x150 to match
+  `rocket_art`'s footprint -- thresholded to 1-bit the same way, bit-
+  packed the same way, round-trip-verified the same way, all via a
+  one-off conversion script rather than hand-transcribing). Shown
+  whenever nothing has ever arrived *or* the last frame is older than
+  `TELEMETRY_MISSING_MS` (60s, deliberately much coarser than
+  `LinkStatus::Lost`'s 15s, which stays a live-screen "link degraded"
+  indicator on RECOVERY -- unchanged) -- so a payload that goes quiet
+  mid-flight reverts to this screen too, not just pre-first-contact.
+  Redesigned (2026-08-18, after first feedback on the plain version) to
+  mirror `screen_flight.rs`'s layout pixel-for-pixel rather than being its
+  own design -- same rocket-glyph position (magnifying glass instead),
+  same "SYSTEMS CHECK" table (every row "??", header "SEARCHING" instead
+  of "ROCKET") -- and, critically, calls the *same*
+  `screen_flight::draw_controller_panel` on the right that FLIGHT does
+  (extracted out to make this possible), so the handheld's own GPS lock/
+  battery/command log stay live and visible even while the rocket itself
+  is unheard from, instead of going dark along with the rest of the
+  screen.
+
+### 2026-08-18 -- second feedback pass
+
+- **DIST was a hardcoded `"--"` placeholder, not actually wired up**
+  (`screen_flight.rs`): despite `frame.my_lat`/`fix_lat` both being live
+  by this point, the FLIGHT screen's DIST line never read them. Fixed by
+  reusing the same `haversine_m` calculation `screen_recovery.rs` already
+  did -- both screens now agree.
+- **Footer said "HOLD:BACK" on RECOVERY/DIAG after the tap-to-back
+  change** (`screen_footer.rs`): the label was never updated when the
+  gesture changed from a hold to a tap (see the earlier "Tap, not hold"
+  entry above) -- now reads "TAP:BACK>NAME".
+- **MISSING screen redesigned to mirror FLIGHT instead of being a plain
+  centered icon+label** (`screen_missing.rs`, `screen_flight.rs`'s new
+  `pub draw_controller_panel`/`ROCKET_X`/`ROCKET_Y`/`TABLE_X`/`STATUS_Y`):
+  see the updated MISSING entry above -- this was a full rework of the
+  first version, not an addition to it.
+
+### 2026-08-18 -- third feedback pass: GPS accuracy root-caused
+
+- **Root-caused the "two co-located GPS fixes 60-120ft apart" complaint**:
+  not a units/precision bug (checked `coord_to_decimal`'s `ddmm.mmmm`
+  math by hand -- correct, and the f32 wire format only costs well under
+  a meter). The real cause: `rocket/code.py` and the original
+  `ground/code.py` both send `PMTK313,1` (enable SBAS search) and
+  `PMTK301,2` (DGPS correction source = WAAS) at GPS init; the new Rust
+  `gps.rs`/`nmea.rs` port skipped *all* `PMTK*` commands, including these
+  two, under the mistaken assumption they were sentence-output config
+  like `PMTK314`/`PMTK220` (which really are skippable, chip default
+  covers them). `PMTK313`/`PMTK301` aren't sentence-output settings at
+  all -- skipping them left the ground station's own GPS running
+  uncorrected while the rocket's (still `rocket/code.py`, unchanged) had
+  WAAS the whole time. Fixed in `gps.rs`: new `framed_command`/
+  `send_command` (checksum via `ground-logic::nmea::checksum`, factored
+  out of `parse_rmc`'s own verification -- same algorithm, new direction)
+  sends both at boot, closing the gap with the existing, tested Python
+  behavior.
+- **Also added `PMTK397,0.2`** (static navigation threshold), beyond
+  parity with Python: this GPS's only job is rangefinding a stationary
+  handheld against a stationary/landed rocket, never in-motion tracking,
+  so trading motion accuracy for at-rest stability is a clean win here.
+  0.2 m/s is comfortably under walking pace, so carrying the handheld to
+  search still updates position normally.
+- **Command status was rendering twice** (`screen_flight.rs`,
+  `screen_missing.rs`): the same text (`frame.tx_status`) appeared both
+  as the last line of the CONTROLLER command log *and* again at the
+  bottom status line under the rocket glyph. Fixed -- the bottom line on
+  FLIGHT is now NO-GO-alert-only (blank otherwise); on MISSING it's
+  gone entirely (no live battery to gate a NO-GO check on there anyway).
+- **Low-battery glyph** (`lowbatt_art.rs`, new, same PNG->1-bit->bit-
+  packed pipeline as `missing_art.rs`, source `docs/images/
+  rocket-lowbatt.png`, user-provided): the FLIGHT screen's rocket slot
+  now shows this in place of the normal idle/armed art whenever
+  `tel.batt_volts < NOGO_BATT_V` (3.80, the same threshold that already
+  gated the NO-GO text) -- the glyph and the banner text now agree,
+  instead of only the text changing.
+
+### 2026-08-18 -- fourth feedback pass: GPS fix averaging
+
+Fix confirmed: DIST dropped from 60-120ft to 17-34ft after the PMTK313/
+301/397 change above -- real improvement, but still visibly noisier than
+it should be for two stationary units. User's proposal (having read the
+PA1010D datasheet, `docs/downloads/CD_PA1010D_Datasheet_v.03.pdf` -- note:
+this sandbox has no PDF text/render tooling available (`pdftoppm`/
+`PyPDF2`/etc all missing), so this wasn't independently re-read here; the
+implementation instead leans on `PMTK220`'s already-known semantics from
+`rocket/code.py`'s own `PMTK220,1000` call and well-established public
+MTK3339 command documentation): sample continuously, average over a
+several-second rolling window, and only publish/display every 5-10s
+rather than every fix.
+
+- **`ground-logic/src/fix_average.rs`** (new): `FixAverage`, an O(1)
+  running mean of lat/lon samples (sum + count, no stored history) --
+  hardware-free, host-tested (`tests/fix_average.rs`, 4 cases). Plain
+  arithmetic mean, not a proper geographic centroid -- deliberate, same
+  "curvature doesn't matter at this scale" reasoning as the earlier
+  haversine-vs-flat-earth discussion, just from the opposite direction
+  (samples here are meters apart, not km).
+- **`gps.rs`**: the read loop now folds every valid fix into a
+  `FixAverage` continuously, and only publishes the mean to `MY_GPS`
+  every `FIX_AVERAGE_WINDOW_MS` (5000ms, the responsive end of the user's
+  suggested 5-10s), then resets for the next window. Heading is
+  deliberately *not* averaged (circular quantity, and only valid while
+  moving -- the one case this whole scheme doesn't optimize for) --
+  still just the most recent in-window reading.
+- **Also sends `PMTK220,100`** (request 10Hz fixes, up from the 1Hz both
+  Python files request) to feed the average more raw samples per window,
+  per the user's read of the datasheet. Deliberately left
+  `POLL_PERIOD_MS`/`CHUNK_SIZE` (the I2C read loop's own cadence/chunk
+  size) unchanged -- if the chip now produces more than this loop's
+  existing read budget can drain, the PA1010D's I2C "streaming" interface
+  is designed around exactly that (filler-padded reads, see
+  `NmeaLineReader`'s docs), so the excess is just not captured that
+  cycle, not lost/corrupted or a stall risk. This keeps the change
+  strictly one-directional (more samples when available, never worse
+  than before) without touching core1's existing blocking-I2C timing
+  budget (see `main.rs`'s docs on why that budget matters for button
+  responsiveness).
+
+### 2026-08-18 -- fifth feedback pass: refuse to arm while charging
+
+User observation: ARM could be sent to the rocket even while it was
+charging over USB. Checked `rocket/code.py`'s `Sensor.flight_ready` (the
+rocket's own ARM-refusal check, `common/packet.py`) -- it only covers
+BARO/IMU/LOG, and `Sensor.CHG` is *deliberately* excluded from it (a live
+power state, not a peripheral-health flag, normally 0 for an entire real
+flight -- see `common/src/lib.rs`'s docs). So this was never actually
+gated rocket-side either; the user's memory of "we had this figured out"
+was likely about the handheld side needing to add its own check, which
+didn't exist yet. Also folded in: the low-battery NO-GO gate
+(`screen_flight.rs`) only ever affected the *banner text* -- the ARM
+button itself was never actually disabled by it, at any point in this
+session, which the user's ask surfaced as a second, related gap.
+
+- **`ground-logic/src/nogo.rs`** (new; `ground-logic` now depends on
+  `launchcast-common`, same pattern `rocket-logic` already uses):
+  `nogo_reason(&Telemetry) -> Option<NogoReason>` (`LowBattery` |
+  `Charging`, low-battery takes priority if somehow both apply), hardware-
+  free and host-tested (`tests/nogo.rs`, 6 cases) -- the same threshold
+  (`NOGO_BATT_V`, 3.80) `screen_flight.rs` already used, now centralized
+  here instead of duplicated at each call site.
+- **FLIGHT screen** (`screen_flight.rs`): BATTERY row's " CHG" text
+  replaced with the header's own bolt icon (`icons::draw_bolt`) --
+  bonus fix, the old text form silently overflowed this row past the
+  CONTROLLER column by ~30px at a 3-digit percentage (100% CHG); the
+  icon form only overflows by a few px in that same edge case. NO-GO
+  banner now shows `NogoReason::message()` (either reason, not just low
+  battery). Rocket glyph only swaps to the low-battery art specifically
+  for `LowBattery` -- charging has no dedicated glyph (wasn't asked for,
+  and the header bolt + BATTERY-row bolt already cover it).
+- **Footer** (`screen_footer.rs`): "HOLD:ARM" doesn't render at all when
+  `frame.nogo().is_some()` and the rocket isn't already armed -- blank
+  instead, so nothing invites a press that would only be refused.
+  DISARM is unaffected regardless of NOGO -- the gate is about
+  preventing a *new* arm, never about trapping the user out of disarming
+  one that's already active.
+- **`main.rs`'s `core0_task`**: the actual send is refused too (`cmd =
+  None`), not just the UI hint -- defense in depth if a stray/queued
+  press reaches this point anyway. The footer suppression is the primary
+  guard (nothing should invite the press); this is the guarantee that
+  matters even if that primary guard is ever wrong.
+
+**Considered and declined**: the handheld showing its own charging status
+(bolt icon in the header/CONTROLLER panel) turns out to need real USB/
+VBUS presence sensing, which RP2040 doesn't have natively (no dedicated
+VBUS pin on the SoC at all -- it's board-wiring-dependent whether one's
+broken out to a GPIO, unconfirmed for this board) and embassy-rp's USB
+driver doesn't provide either (it force-overrides VBUS-detect to "always
+present" rather than reading real hardware state -- literal `// TODO:
+implement VBUS detection` in `embassy-rp-0.10.0/src/usb.rs`). The
+alternative, a full `embassy-usb` CDC device mirroring how CircuitPython's
+`supervisor.runtime.usb_connected` actually works (checks USB enumeration,
+not a power-good signal), is real effort for a status icon. User's call:
+not worth it -- the rocket is never charging on a launch pad, which was
+the actual scenario this whole thread started from; `frame.my_charging`
+stays hardcoded `false` (unchanged from before).
 
 Not started: the rocket/payload firmware crate itself (only its
 hardware-free logic exists so far, in `rocket-logic`). The current
@@ -620,12 +840,103 @@ CircuitPython side currently gets for free.
 Not a final decision — the new thread should work this out properly, but as
 a starting point:
 
-**Rocket**: all three onboard sensors (BMP580, LSM6DSOX, LIS3MDL) and the GPS
-share one I2C bus (`STEMMA_I2C`), so they naturally belong on the same core to
-avoid cross-core bus arbitration. Proposed split: **core0** = sense (I2C) +
-flight state machine + flash logging (the latency-sensitive, must-not-drop
-path); **core1** = radio TX (already documented as best-effort/time-boxed in
-the current design, so it tolerates being the "lower priority" core).
+**Rocket — revised 2026-08-18, superseding the original strawman below**
+(not started yet; discussed and largely settled before writing any code,
+same "decide the split before building" discipline the ground station
+used):
+
+- **Core0 = radio (RX uplink commands, TX telemetry) + flash log flushes.**
+  Radio behavior is deliberately **phase-agnostic** -- it runs one
+  unchanging loop for the entire flight, always relaying whatever
+  telemetry core1 last produced and always forwarding any received
+  command. This works because the flight-state machine (`rocket-logic`)
+  already refuses ARM outside IDLE and DISARM outside ARMED, with no path
+  back to ARMED once boosted -- an uplink command arriving mid-flight is
+  already inert by the state machine's own transition rules, so core0
+  doesn't need to know or care what phase the flight is in.
+- **Core1 = the shared I2C bus (BMP580 + LSM6DSOX + LIS3MDL + GPS, all on
+  `STEMMA_I2C`) + the flight-state machine + a RAM ring buffer of
+  pending log entries.** One core, not split further, because all four
+  sensors share one physical bus -- unlike the ground station's SPI1
+  (radio) vs. PIO-SPI (display) split, there's no second bus available
+  here to hand a subset of sensors to the other core without adding
+  cross-core bus-arbitration contention, which is exactly what the core
+  split exists to avoid. Polling cadence per sensor is phase-dependent
+  (see the flight-phase table below) but that's a scheduling policy
+  *within* this one core's loop, not a core assignment.
+- Cross-core plumbing mirrors the ground station's already-proven
+  pattern, just with the roles reversed: a `Mutex`-guarded latest-
+  `Telemetry` (core1 writes on every update, core0 reads for TX -- same
+  shape as `ground/src/gps.rs`'s `MY_GPS`), a bounded `Channel` for
+  inbound commands (core0 writes, core1 reads -- same shape as
+  `BUTTON_EVENTS`), and a second bounded `Channel` for batched log-entry
+  chunks (core1 writes, core0 reads and actually flushes to flash).
+
+Proposed flight-phase polling policy (core1's own scheduling, not a core
+assignment -- see `rocket-logic`'s existing `FlightState` for the phases
+themselves):
+
+| Phase | Accel/gyro | Baro | GPS | Log writes |
+|---|---|---|---|---|
+| BOOT/IDLE | ~1/15s | ~1/15s | ~1/15s | none (matches current `flight.bin` gating: logging starts only from ARMED onward) |
+| ARMED | fast (launch detection is the priority) | slow | slow/paused | none yet |
+| BOOST/COAST | fast (cheap, already being read) | fast (velocity/apogee needs it) | paused (not useful mid-flight, frees bus time for baro/accel) | fast, into the RAM ring buffer |
+| APOGEE/DESCENT | fast | fast | paused | fast, into the RAM ring buffer |
+| LANDED | slow | slow | resumed | stopped; final buffer flush |
+
+**Why flash logging needs a RAM ring buffer, not straight-through writes**
+(the one piece of this that took real digging, not just a plausible
+guess -- verified against `embassy-rp 0.10.0`'s actual flash driver
+source, `src/flash.rs`, not assumed):
+
+- NOR flash (what's on this board, like nearly all MCU flash) can only
+  flip bits `1->0` on a write; reusing a region for new data requires
+  first *erasing* it back to all-`1`s, and erase only works in whole
+  blocks -- RP2040's minimum erasable unit is a 4KB sector
+  (`ERASE_SIZE = 4096` in `embassy-rp`'s flash driver). A page program
+  (~256 bytes) is cheap (sub-ms to a couple ms on typical QSPI NOR
+  flash), but crossing into a fresh sector costs a full sector erase --
+  typically tens to low hundreds of milliseconds on typical QSPI NOR
+  flash parts (this board's exact chip/timings not yet confirmed against
+  a datasheet) -- and lands wherever a sector boundary happens to fall
+  relative to sample timing, not somewhere you get to choose.
+- RP2040 executes its own program code directly out of the same flash
+  chip (XIP) -- there's no separate code/data flash split -- so nothing
+  can execute from flash on *either* core while an erase/program is in
+  flight. `embassy-rp`'s flash driver enforces this concretely, not just
+  in theory: `blocking_erase`/`blocking_write` check `pac::SIO.cpuid()`
+  and return `Error::InvalidCore` if not called from core0, then call
+  `multicore::pause_core1()` -- a real blocking handshake over the
+  inter-core FIFO that halts core1 and waits for it to confirm before
+  proceeding -- then run the actual flash operation inside a
+  `critical_section` (interrupts off on core0 too), then explicitly
+  resume core1 afterward. So a sector erase isn't "core1's sensor loop
+  stalls" -- it's **both cores fully frozen**, and since core0's
+  interrupts are off too, any radio RX arriving during that window is
+  simply missed, not queued.
+- Concrete failure case: a ~20-30 byte BOOST-phase log entry at a
+  generously-fast 50-100Hz sample rate fills a 4KB sector roughly every
+  1.5-4 seconds -- well within a typical few-second motor burn. Writing
+  straight-through, there's a real chance a 100+ms total-freeze lands
+  *during* the burn itself, right when continuous, evenly-spaced samples
+  matter most for reconstructing the acceleration/velocity curve for
+  apogee detection -- and that window's samples are lost outright (data
+  never captured, not just captured late), not merely delayed.
+- The fix: core1 accumulates samples in an SRAM ring buffer (RP2040 has
+  264KB -- buffering several seconds of samples costs tens of KB at
+  most), which costs nothing in cross-core terms since it never touches
+  flash. The freeze is only unavoidable at the moment flash is actually
+  written, so buffering lets the flush *schedule* be chosen deliberately
+  (e.g. once a second, or at phase transitions like BOOST->COAST) instead
+  of happening wherever a sample's write happens to cross a sector
+  boundary. Since only core0 may call the flash API, core1 hands batched
+  entries to core0 over a channel rather than writing flash itself --
+  see the core split above.
+- Still open: exact flush cadence/triggers (time-based, buffer-fill-based,
+  phase-transition-based, or some mix), and whether flight-critical data
+  should also fsync-equivalent (force a flush) immediately on any phase
+  transition, not just LANDED, in case of an unexpected early power loss
+  (ejection charge failure, hard landing, etc.) -- not decided yet.
 
 **Ground — decided 2026-08-16, revised from the original strawman below**:
 **core0** = radio RX + GPS; **core1** = button sampling/dispatch + display
@@ -648,6 +959,13 @@ not shared mutable state.
 
 Original strawman (superseded above, kept for the record): core0 = button
 sampling + dispatch only; core1 = radio RX + GPS + display rendering.
+
+Original *rocket* strawman (superseded above, kept for the record): core0 =
+sense (I2C) + flight state machine + flash logging; core1 = radio TX only.
+Reversed once the flash-write constraints above were actually checked
+against `embassy-rp`'s source rather than assumed -- flash operations can
+only be issued from core0, which doesn't fit cleanly with core0 being the
+"radio only" core in the original draft.
 
 ## Migration strategy
 
@@ -718,3 +1036,7 @@ just by changing language:
 - Does flash-based flight logging move to a raw partition (sidesteps FAT
   corruption entirely) or stay FAT-based for easy host-side retrieval via
   `make pull-log`? These are in tension. Still open — not reached yet.
+  Orthogonal to (doesn't resolve) the RAM-ring-buffer/flush-cadence
+  question in the Strawman architecture section above — the erase/
+  multicore-pause cost of a raw flash write applies either way; a FAT
+  filesystem would just add its own bookkeeping writes on top.

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 # thumbv6m-none-eabi once launchcast-ground wires it to real buttons, but
 # every test here runs on the host with no hardware involved.
 [dependencies]
+launchcast-common = { path = "../common" }
 libm = "0.2"
 # For NmeaLineReader's line-assembly buffer (nmea.rs) -- version matches
 # what's already resolved transitively elsewhere in the workspace.

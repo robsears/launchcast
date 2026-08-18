@@ -3,11 +3,13 @@
 //!
 //! Contextual per screen -- see the ARM/DISARM vs BACK split in
 //! `main.rs`'s button dispatch, which this must stay in sync with:
-//!   - FLIGHT: ARM/DISARM sends the command; MENU advances to the next
-//!     screen.
-//!   - anywhere else: ARM/DISARM goes back one screen instead (MENU still
-//!     advances, so the screen list is a loop you can walk either
-//!     direction a step at a time).
+//!   - FLIGHT: a 2s **hold** sends the ARM/DISARM command; MENU advances
+//!     to the next screen.
+//!   - anywhere else: a mere **tap** on the same button goes back one
+//!     screen instead (no hold needed -- there's no command to guard
+//!     against a mis-press on these screens). MENU still advances, so the
+//!     screen list is a loop you can walk either direction a step at a
+//!     time.
 //!
 //! Only FLIGHT exists so far, so `is_flight` is always `true` at every
 //! call site today -- kept as a real parameter (not hardcoded) since
@@ -29,9 +31,24 @@ where
 {
     let mut arm_label: String<24> = String::new();
     if is_flight {
-        let _ = arm_label.push_str(if frame.armed() { "HOLD:DISARM" } else { "HOLD:ARM" });
+        if frame.armed() {
+            // Always allowed regardless of NOGO -- the gate is about
+            // preventing a *new* arm, never about trapping the user out
+            // of disarming one that's already active.
+            let _ = arm_label.push_str("HOLD:DISARM");
+        } else if frame.nogo().is_none() {
+            let _ = arm_label.push_str("HOLD:ARM");
+        }
+        // else: leave blank -- a NOGO condition (low battery/charging,
+        // see ground-logic::nogo) means holding this button does
+        // nothing right now (see main.rs's core0_task), so nothing
+        // should invite the press. The NO-GO banner on FLIGHT itself
+        // explains why.
     } else {
-        let _ = core::fmt::write(&mut arm_label, format_args!("HOLD:BACK>{prev_screen_name}"));
+        // A tap, not a hold, navigates back off FLIGHT -- see main.rs's
+        // button_task -- so this label must say so too, or it implies a
+        // 2s hold is still required here.
+        let _ = core::fmt::write(&mut arm_label, format_args!("TAP:BACK>{prev_screen_name}"));
     }
 
     let mut menu_label: String<24> = String::new();

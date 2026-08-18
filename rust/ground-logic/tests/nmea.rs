@@ -1,4 +1,4 @@
-use launchcast_ground_logic::{parse_rmc, NmeaLineReader};
+use launchcast_ground_logic::{checksum, parse_rmc, NmeaLineReader};
 
 // The textbook example sentence used across NMEA 0183 references
 // (including Wikipedia's NMEA 0183 article) -- checksum 6A is a known
@@ -47,6 +47,22 @@ fn empty_track_angle_is_none() {
     let sentence = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,,230394,003.1,W*4C";
     let fix = parse_rmc(sentence).expect("valid sentence should parse");
     assert_eq!(fix.track_deg, None);
+}
+
+#[test]
+fn checksum_matches_the_textbook_example() {
+    // "$PMTK220,100*2F" -- a known-good PMTK command/checksum pair
+    // (also used as a reference value in the adafruit_gps Rust crate's
+    // own test suite).
+    assert_eq!(checksum("PMTK220,100"), 0x2F);
+}
+
+#[test]
+fn checksum_matches_the_outgoing_gps_init_commands() {
+    // Hand-computed (Python's `functools.reduce(xor)`), for the two
+    // commands ground/src/gps.rs actually sends at boot.
+    assert_eq!(checksum("PMTK313,1"), 0x2E);
+    assert_eq!(checksum("PMTK301,2"), 0x2E);
 }
 
 #[test]

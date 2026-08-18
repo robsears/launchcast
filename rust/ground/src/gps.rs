@@ -2,29 +2,48 @@
 //! to the rocket's last known fix on the RECOVERY screen. Port of the GPS
 //! half of `Hardware`/`code.py`'s main loop.
 //!
-//! Sentence parsing (`NmeaLineReader`, `parse_rmc`) lives in
-//! `ground-logic`, hardware-free and host-tested (see its module docs for
-//! why sending `PMTK*` configuration commands is skipped for now) -- this
-//! module is only the I2C transport loop wired to real hardware.
+//! Sentence parsing (`NmeaLineReader`, `parse_rmc`, `checksum`) lives in
+//! `ground-logic`, hardware-free and host-tested (see its module docs) --
+//! this module is only the I2C transport, both the read loop and the
+//! `PMTK*` init writes that enable SBAS/WAAS correction on this GPS to
+//! match `rocket/code.py`'s (see `ground-logic`'s docs for why the
+//! accuracy gap that motivated this existed at all).
+//!
+//! Published fixes are a rolling [`FixAverage`] over
+//! [`FIX_AVERAGE_WINDOW_MS`], not the single latest sentence: this GPS's
+//! whole job is rangefinding a *stationary* handheld (see CLAUDE.md/the
+//! session that added the PMTK313/301/397 init above), and a raw
+//! instantaneous fix visibly wanders several meters sample-to-sample even
+//! at rest. Averaging several seconds' worth settles that out, at the
+//! cost of the displayed position lagging real motion by about that same
+//! window -- an explicit, acceptable trade for a rangefinder, not
+//! something a moving-vehicle tracker could get away with.
 
 use embassy_rp::i2c::{Blocking, I2c};
 use embassy_rp::peripherals::I2C1;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Timer;
-use launchcast_ground_logic::{parse_rmc, NmeaLineReader};
+use embassy_time::{Duration, Instant, Timer};
+use heapless::String;
+use launchcast_ground_logic::{checksum, parse_rmc, FixAverage, NmeaLineReader};
 
 /// Confirmed via CLAUDE.md and `adafruit_gps`'s own default -- the
 /// PA1010D's fixed I2C address.
 const GPS_I2C_ADDR: u16 = 0x10;
 /// Matches `adafruit_gps`'s I2C `_fill()` default chunk size.
 const CHUNK_SIZE: usize = 32;
-/// How often to poll I2C for new bytes -- well under the GPS's ~1Hz fix
-/// rate, so a sentence is picked up promptly once it's actually ready.
+/// How often to poll I2C for new bytes. Independent of the GPS's own fix
+/// rate (see `PMTK220,100` below) -- this just needs to be frequent
+/// enough that a `CHUNK_SIZE`-byte read doesn't fall behind whatever the
+/// chip is actually producing.
 const POLL_PERIOD_MS: u64 = 200;
 /// Matches `code.py`'s "course over ground substitutes for a compass...
 /// only valid while moving" gate.
 const MIN_SPEED_FOR_HEADING_KNOTS: f32 = 1.0;
+/// How often to publish an averaged fix to [`MY_GPS`]. Every valid
+/// sentence received in between is folded into the running mean, not
+/// discarded -- see the module docs above.
+const FIX_AVERAGE_WINDOW_MS: u64 = 5000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MyFix {
@@ -40,10 +59,63 @@ pub struct MyFix {
 /// ever assigns `my_lat`/`my_lon`, never clears them).
 pub static MY_GPS: Mutex<CriticalSectionRawMutex, Option<MyFix>> = Mutex::new(None);
 
+/// Frame a raw PMTK payload (e.g. `"PMTK301,2"`) into the full command
+/// bytes the chip expects: `"$PAYLOAD*XX\r\n"`, checksum computed the
+/// same way incoming sentences are verified (see `ground-logic::nmea`).
+fn framed_command<const N: usize>(payload: &str) -> String<N> {
+    let mut s: String<N> = String::new();
+    let _ = s.push('$');
+    let _ = s.push_str(payload);
+    let _ = s.push('*');
+    let _ = core::fmt::write(&mut s, format_args!("{:02X}", checksum(payload)));
+    let _ = s.push_str("\r\n");
+    s
+}
+
+fn send_command(i2c: &mut I2c<'static, I2C1, Blocking>, payload: &str) {
+    let cmd: String<32> = framed_command(payload);
+    // Best-effort -- if the chip doesn't ack, the GPS still works on
+    // whatever its own defaults are, same fallback posture as skipping
+    // PMTK314/PMTK220 entirely (see module docs).
+    let _ = i2c.blocking_write(GPS_I2C_ADDR, cmd.as_bytes());
+}
+
 #[embassy_executor::task]
 pub async fn gps_task(mut i2c: I2c<'static, I2C1, Blocking>) {
+    // Session-only (reset by a power cycle), matches rocket/code.py and
+    // the original ground/code.py's own GPS init -- see module docs.
+    send_command(&mut i2c, "PMTK313,1"); // enable SBAS satellite search
+    send_command(&mut i2c, "PMTK301,2"); // DGPS correction source = WAAS
+    // Beyond parity with the Python reference: this GPS's only job is
+    // rangefinding a stationary handheld against a stationary (or
+    // landed) rocket -- it's never used for in-motion tracking. MTK's
+    // static-navigation threshold holds the reported fix steady below a
+    // speed cutoff instead of showing normal GPS "wander" at rest, which
+    // is exactly the accuracy trade this GPS should make. 0.2 m/s is
+    // comfortably below walking pace (~0.5-1.4 m/s), so carrying the
+    // handheld to search still updates position normally.
+    send_command(&mut i2c, "PMTK397,0.2");
+    // Also beyond parity: rocket/code.py and the original ground/code.py
+    // both request PMTK220,1000 (1Hz). The PA1010D datasheet documents
+    // up to 10Hz, and more raw fixes per averaging window (see module
+    // docs) directly means a better-settled average -- this can only
+    // help, never hurt: POLL_PERIOD_MS/CHUNK_SIZE below are unchanged, so
+    // if the chip produces more data than this loop's read budget can
+    // drain, the excess is simply not captured this cycle (the PA1010D's
+    // I2C "streaming" interface is designed around exactly that -- see
+    // NmeaLineReader's filler-byte handling), not lost/corrupted.
+    send_command(&mut i2c, "PMTK220,100");
+    // Give the chip a moment to digest all four writes before the read
+    // loop starts hammering it -- not required by the protocol, just
+    // cheap insurance against racing the chip's own ack.
+    Timer::after_millis(POLL_PERIOD_MS).await;
+
     let mut reader: NmeaLineReader<96> = NmeaLineReader::new();
     let mut chunk = [0u8; CHUNK_SIZE];
+    let mut avg = FixAverage::new();
+    let mut heading = None;
+    let mut window_deadline = Instant::now() + Duration::from_millis(FIX_AVERAGE_WINDOW_MS);
+
     loop {
         if i2c.blocking_read(GPS_I2C_ADDR, &mut chunk).is_ok() {
             for &byte in &chunk {
@@ -56,18 +128,30 @@ pub async fn gps_task(mut i2c: I2c<'static, I2C1, Blocking>) {
                 if !fix.valid {
                     continue;
                 }
-                let heading = if fix.speed_knots > MIN_SPEED_FOR_HEADING_KNOTS {
+                avg.add(fix.lat, fix.lon);
+                // Not averaged -- course-over-ground is a circular
+                // quantity (allowed to average through a "wrap" like
+                // 359 deg/1 deg to something meaningless), and only
+                // valid while moving anyway, which is the one case this
+                // whole window-averaging scheme deliberately doesn't
+                // optimize for. Just track the most recent reading.
+                heading = if fix.speed_knots > MIN_SPEED_FOR_HEADING_KNOTS {
                     fix.track_deg
                 } else {
                     None
                 };
-                *MY_GPS.lock().await = Some(MyFix {
-                    lat: fix.lat,
-                    lon: fix.lon,
-                    heading,
-                });
             }
         }
+
+        let now = Instant::now();
+        if now >= window_deadline {
+            if let Some((lat, lon)) = avg.mean() {
+                *MY_GPS.lock().await = Some(MyFix { lat, lon, heading });
+            }
+            avg.reset();
+            window_deadline = now + Duration::from_millis(FIX_AVERAGE_WINDOW_MS);
+        }
+
         Timer::after_millis(POLL_PERIOD_MS).await;
     }
 }

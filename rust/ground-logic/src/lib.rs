@@ -6,18 +6,22 @@
 //! firmware crate) wires these to real hardware.
 #![cfg_attr(not(test), no_std)]
 
+pub mod fix_average;
 pub mod hold_tracker;
 pub mod icons;
 pub mod imu;
 pub mod link;
 pub mod nav;
 pub mod nmea;
+pub mod nogo;
 pub mod units;
 
+pub use fix_average::FixAverage;
 pub use hold_tracker::{Edge, HoldTracker, KeyEvent, DEFAULT_GRACE_MS, DEFAULT_HOLD_MS};
-pub use icons::{battery_level, battery_percent, signal_level, signal_percent, BATT_CURVE};
+pub use nogo::{nogo_reason, NogoReason, NOGO_BATT_V};
+pub use icons::{battery_level, battery_percent, signal_level, signal_percent};
 pub use imu::accel_magnitude_g;
-pub use link::{link_status, LinkStatus, LINK_LOST_MS, LINK_STALE_MS};
+pub use link::{link_status, telemetry_missing, LinkStatus, LINK_LOST_MS, LINK_STALE_MS, TELEMETRY_MISSING_MS};
 pub use nav::{bearing_deg, compass_point, haversine_m, relative_arrow, EARTH_R_M};
-pub use nmea::{parse_rmc, NmeaLineReader, RmcFix};
+pub use nmea::{checksum, parse_rmc, NmeaLineReader, RmcFix};
 pub use units::{c_to_f, m_to_ft, Units};

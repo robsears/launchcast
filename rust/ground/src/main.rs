@@ -41,6 +41,7 @@
 
 mod battery;
 mod buttons;
+mod cmdlog;
 mod display;
 mod display_util;
 mod frame;
@@ -49,6 +50,8 @@ mod handheld_art;
 mod icon_bitmaps;
 mod icons;
 mod link;
+mod lowbatt_art;
+mod missing_art;
 mod radio;
 mod rocket_art;
 mod screen;
@@ -56,6 +59,7 @@ mod screen_diagnostics;
 mod screen_flight;
 mod screen_footer;
 mod screen_header;
+mod screen_missing;
 mod screen_recovery;
 
 use core::ptr::addr_of_mut;
@@ -81,7 +85,7 @@ use embassy_time::{Delay, Instant, Timer};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use launchcast_common as common;
-use launchcast_ground_logic::{link_status, Edge};
+use launchcast_ground_logic::{link_status, nogo_reason, telemetry_missing, Edge};
 use panic_probe as _;
 use portable_atomic::Ordering;
 use static_cell::StaticCell;
@@ -267,11 +271,18 @@ async fn button_task(
                 // MENU: always advances, entirely local to core1 (only
                 // ever touches the display) -- never forwarded.
                 (2, Edge::Tap) => screen::advance(),
-                // ARM/DISARM-as-BACK: off FLIGHT, a hold navigates back
-                // instead of sending a command -- also entirely local,
+                // ARM/DISARM-as-BACK: off FLIGHT, either gesture
+                // navigates back immediately -- a tap, not the full 2s
+                // hold, since there's no command to arm on these
+                // screens to guard against a mis-press. Entirely local,
                 // and specifically NOT forwarded, so core0 never sees an
-                // ARM/DISARM hold that doesn't actually mean "send it".
-                (0, Edge::Hold) if screen::current() != screen::FLIGHT => screen::back(),
+                // ARM/DISARM press that doesn't actually mean "send it".
+                (0, _) if screen::current() != screen::FLIGHT => screen::back(),
+                // On FLIGHT, only a genuine hold means "send ARM/DISARM"
+                // -- a mere tap here does nothing, matching code.py
+                // (which only ever dispatches this button on
+                // `event == "hold"`).
+                (0, Edge::Tap) => {}
                 // Everything else needs the radio: CHIRP always, and
                 // ARM/DISARM holds that got here specifically because
                 // we're on FLIGHT.
@@ -308,6 +319,7 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
     let link = *link::LINK.lock().await;
     let my_gps = *gps::MY_GPS.lock().await;
     let my_batt = *battery::MY_BATT.lock().await;
+    let cmd_log = cmdlog::snapshot().await;
 
     let now = Instant::now();
     let age_ms = link.age_ms(now);
@@ -332,9 +344,13 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
         // wired up yet -- see battery.rs's docs.
         my_charging: false,
         // ARM/DISARM pending-confirmation status (code.py's `tx_status`,
-        // `CMD_CONFIRM_FRAMES`) isn't ported yet -- a static placeholder
-        // for now rather than a half-built state machine.
-        tx_status: "ready",
+        // `CMD_CONFIRM_FRAMES`) -- see cmdlog.rs, driven from core0_task.
+        tx_status: if cmd_log.tx_status.is_empty() {
+            "ready"
+        } else {
+            &cmd_log.tx_status
+        },
+        cmd_log: &cmd_log.lines,
         screen_name: screen::current_name(),
         next_screen_name: screen::next_name(),
         prev_screen_name: screen::prev_name(),
@@ -342,18 +358,18 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
 
     screen_header::draw(display, &frame);
 
-    match frame.tel {
-        None => {
-            let mut line: heapless::String<32> = heapless::String::new();
-            let _ = core::fmt::write(&mut line, format_args!("rejects: {}", frame.rejects));
-            display_util::text(display, 4, 90, "NO TELEMETRY", 3);
-            display_util::text(display, 4, 130, &line, 1);
-        }
-        Some(t) => match screen::current() {
+    // MISSING replaces the current screen's body whenever nothing has
+    // ever arrived, or the last frame is older than TELEMETRY_MISSING_MS
+    // -- so a payload that goes quiet mid-flight reverts here too, not
+    // just before the very first frame (see screen_missing.rs).
+    if telemetry_missing(age_ms) {
+        screen_missing::draw(display, &frame);
+    } else if let Some(t) = frame.tel {
+        match screen::current() {
             screen::RECOVERY => screen_recovery::draw(display, &frame),
             screen::DIAG => screen_diagnostics::draw(display, &frame, t),
             _ => screen_flight::draw(display, &frame, t),
-        },
+        }
     }
 
     let is_flight = screen::current() == screen::FLIGHT;
@@ -436,17 +452,24 @@ async fn core0_task(
                 // is underway (BOOST and beyond) a stray hold shouldn't
                 // read as "send DISARM".
                 (0, Edge::Hold) => {
-                    let armed = link::LINK
-                        .lock()
-                        .await
-                        .latest
-                        .as_ref()
-                        .is_some_and(|(t, _, _)| t.state == common::State::ARMED);
-                    Some(if armed {
-                        common::Command::DISARM
+                    let latest = link::LINK.lock().await.latest;
+                    let armed = latest.as_ref().is_some_and(|(t, _, _)| t.state == common::State::ARMED);
+                    if armed {
+                        Some(common::Command::DISARM)
+                    } else if latest.as_ref().is_some_and(|(t, _, _)| nogo_reason(t).is_some()) {
+                        // Defense in depth, not the primary guard: the
+                        // footer (screen_footer.rs) already suppresses
+                        // "HOLD:ARM" and shouldn't invite this press at
+                        // all when NOGO applies. This still refuses the
+                        // send even if something forwarded the event
+                        // anyway (a stray/queued press, a future screen
+                        // that forgets the check, etc.) -- an ARM must
+                        // never reach the radio while NOGO is active,
+                        // full stop.
+                        None
                     } else {
-                        common::Command::ARM
-                    })
+                        Some(common::Command::ARM)
+                    }
                 }
                 (1, Edge::Tap) => Some(common::Command::CHIRP),
                 _ => None,
@@ -457,6 +480,11 @@ async fn core0_task(
                 match radio.send_command(seq, cmd).await {
                     Ok(()) => {
                         defmt::info!("core0: sent command {} (seq {})", cmd, seq);
+                        // Snapshot PACKET_COUNT *before* it can advance any
+                        // further -- matches code.py's `link.packets` at
+                        // the moment of send, the baseline `cmdlog::poll`
+                        // counts confirmation frames against.
+                        cmdlog::record_send(cmd, radio::PACKET_COUNT.load(Ordering::Relaxed)).await;
                         // One deliberate, longer flash -- distinct from
                         // the per-packet RX flicker below -- so a command
                         // send is visually identifiable on its own.
@@ -509,5 +537,14 @@ async fn core0_task(
                 }
             }
         }
+
+        // -- confirm or fail a pending ARM/DISARM ------------------------
+        // Every iteration, not just when a frame just arrived -- the
+        // link-lost branch below has to fire even if nothing is arriving
+        // at all to count. Matches ground/code.py ~L480-494.
+        let snapshot = *link::LINK.lock().await;
+        let current_state = snapshot.latest.as_ref().map(|(t, _, _)| t.state);
+        let status = link_status(snapshot.age_ms(Instant::now()));
+        cmdlog::poll(current_state, radio::PACKET_COUNT.load(Ordering::Relaxed), status).await;
     }
 }

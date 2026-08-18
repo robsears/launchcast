@@ -15,14 +15,22 @@
 //!   GPS (`latitude`, `longitude`, `speed_knots`, `track_angle_deg`), so
 //!   nothing else is parsed.
 //!
-//! `ground/code.py` also sends `PMTK314`/`PMTK220`/`PMTK313`/`PMTK301`
-//! commands to configure which sentences the chip emits and at what rate
-//! -- not sent by this port yet (a real, deliberate simplification, not
-//! an oversight): PA1010D/MTK3339-family chips emit RMC by factory
-//! default, and MTK sentence-output configuration is session-only
-//! (reset by a power cycle) unless separately told to persist, so
-//! skipping it just means relying on the chip's own default output
-//! rather than Python's explicit one.
+//! `ground/code.py` also sends `PMTK314`/`PMTK220` to configure which
+//! sentences the chip emits and at what rate -- not sent by this port:
+//! PA1010D/MTK3339-family chips emit RMC by factory default, and MTK
+//! sentence-output configuration is session-only (reset by a power
+//! cycle) unless separately told to persist, so skipping these two just
+//! means relying on the chip's own default output rather than Python's
+//! explicit one.
+//!
+//! `PMTK313`/`PMTK301` (enable SBAS search / DGPS correction source =
+//! WAAS) are a different matter -- those aren't sentence-output settings
+//! at all, they're accuracy config, and skipping them left this GPS
+//! running uncorrected while the rocket's (which still runs
+//! `rocket/code.py`, unchanged) sends both at boot. That asymmetry showed
+//! up as a large (60-120ft) gap between two at-rest fixes that should've
+//! read the same. [`checksum`] plus the framing in `ground/src/gps.rs`
+//! sends both, closing the gap with the existing, tested Python behavior.
 
 use heapless::String;
 
@@ -76,6 +84,14 @@ impl<const N: usize> NmeaLineReader<N> {
     }
 }
 
+/// XOR checksum of an NMEA sentence body (the bytes between `$` and `*`).
+/// Used both to verify incoming sentences ([`parse_rmc`]) and to frame
+/// outgoing `PMTK*` configuration commands (see `ground/src/gps.rs`) --
+/// the same algorithm either direction.
+pub fn checksum(body: &str) -> u8 {
+    body.bytes().fold(0u8, |acc, b| acc ^ b)
+}
+
 /// A decoded `$..RMC` sentence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RmcFix {
@@ -117,7 +133,7 @@ pub fn parse_rmc(sentence: &str) -> Option<RmcFix> {
     let sentence = sentence.trim();
     let (body, checksum_hex) = sentence.strip_prefix('$')?.split_once('*')?;
     let expected = u8::from_str_radix(checksum_hex.trim(), 16).ok()?;
-    let actual = body.bytes().fold(0u8, |acc, b| acc ^ b);
+    let actual = checksum(body);
     if actual != expected {
         return None;
     }
