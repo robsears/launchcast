@@ -1,0 +1,19 @@
+[package]
+name = "launchcast-ground-logic"
+version = "0.1.0"
+edition = "2021"
+description = "LaunchCast ground station hardware-free logic (port of ground/hold_tracker.py and friends)"
+license = "Apache-2.0"
+
+[lib]
+name = "launchcast_ground_logic"
+path = "src/lib.rs"
+
+# Same rationale as launchcast-common: no_std/alloc-free so it builds for
+# thumbv6m-none-eabi once launchcast-ground wires it to real buttons, but
+# every test here runs on the host with no hardware involved.
+[dependencies]
+libm = "0.2"
+# For NmeaLineReader's line-assembly buffer (nmea.rs) -- version matches
+# what's already resolved transitively elsewhere in the workspace.
+heapless = "0.9"

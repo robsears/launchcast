@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["common", "ground-logic", "ground", "rocket-logic"]
+
+# `ground` is a thumbv6m-none-eabi (Cortex-M0+) firmware crate and can't be
+# built for the host, so it's excluded from the default host `cargo build`/
+# `cargo test` run at the workspace root. Build it explicitly with
+# `cargo build -p launchcast-ground --target thumbv6m-none-eabi`.
+default-members = ["common", "ground-logic", "rocket-logic"]

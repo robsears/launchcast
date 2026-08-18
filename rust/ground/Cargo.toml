@@ -1,0 +1,80 @@
+[package]
+name = "launchcast-ground"
+version = "0.1.0"
+edition = "2021"
+description = "LaunchCast handheld ground station firmware (Rust rewrite)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "launchcast-ground"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+launchcast-common = { path = "../common" }
+launchcast-ground-logic = { path = "../ground-logic" }
+
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+# critical-section-impl: required by embassy-rp's own multicore docs
+# whenever embassy-sync primitives (our inter-core Channel) are shared
+# across cores.
+embassy-rp = { version = "0.10", features = ["rp2040", "time-driver", "critical-section-impl"] }
+embassy-sync = "0.8"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+defmt = "0.3"
+defmt-rtt = "0.4"
+static_cell = "2"
+# thumbv6m (Cortex-M0+) has no native atomic CAS, so static_cell's
+# transitive portable-atomic dependency needs the critical-section-backed
+# fallback rather than a hardware compare-exchange. Declared directly here
+# (not just left transitive) so Cargo's feature unification actually
+# enables it for the shared portable-atomic in the dependency graph.
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+# Sharp Memory Display: no usable driver crate exists yet on stable Rust --
+# see docs/rust-rewrite.md for why. embedded-graphics is still the right
+# building block regardless of how the driver itself gets written.
+embedded-graphics = "0.8"
+# "async" feature: needed for ExclusiveDevice to wrap an async SPI (the
+# radio's SPI1, driven with DMA) as an embedded-hal-async SpiDevice, which
+# is what lora-phy requires.
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+embedded-hal-async = "1"
+
+# RFM95/SX1276 LoRa radio. MIT OR Apache-2.0, maintained under the
+# lora-rs/embassy-rs org (not a random third-party driver) -- see
+# docs/rust-rewrite.md for the ecosystem check. No lorawan-radio feature:
+# this is a private LoRa P2P link (custom sync word, no LoRaWAN join/MAC
+# layer), matching what `adafruit_rfm9x` already does on both ends.
+#
+# Pinned to a specific git commit, not the crates.io release (3.0.1):
+# 3.0.1's public API only lets `LoRa::new` pick between the two hardcoded
+# LoRaWAN sync words (public 0x34 / private 0x12) -- there's no way to set
+# an arbitrary custom sync word at that version, at any level (checked
+# `RadioKind::init_lora`, which takes `is_public_network: bool`, not a raw
+# word). This ground station has to interoperate with the real deployed
+# rocket firmware's `packet.SYNC_WORD = 0x2B`, which is neither of those,
+# so 3.0.1 can't do this at all. `LoRa::with_syncword(radio_kind, sync_word:
+# u8, delay)` exists on `main` (unreleased as of 2026-08-17) and takes the
+# sync word directly in the same legacy single-byte form
+# `adafruit_rfm9x.sync_word` already uses. Pinned to an exact commit for
+# reproducibility, not floating on `main`.
+lora-phy = { git = "https://github.com/lora-rs/lora-rs", rev = "5cd9cb3097770f6d976de012b2265676956cadc7", features = [
+  "defmt-03",
+] }
+
+# Fixed-capacity String + core::fmt::Write, for rendering live telemetry
+# text on the display without a heap. Version pinned to what's already
+# resolved transitively (via embassy's own dependency tree) so this
+# doesn't pull in a second copy.
+heapless = "0.9"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"

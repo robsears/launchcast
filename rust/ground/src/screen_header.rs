@@ -1,0 +1,46 @@
+//! Header rendered on every screen: title, screen name, and the global
+//! status icons (rocket cluster: payload icon/link signal/payload
+//! battery; handheld's own battery). Port of `screen_header.py`.
+//!
+//! Screens should not draw above y=40 -- that band belongs to the header.
+//! Screen size: 400x240 (matches `screen_header.py`'s own comment).
+
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics::pixelcolor::BinaryColor;
+
+use crate::display_util::text;
+use crate::frame::Frame;
+use crate::icons;
+
+pub fn draw<D>(display: &mut D, frame: &Frame)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    text(display, 4, 4, "LAUNCHCAST", 2); // 16x16, 160px wide (Python's own sizing)
+    text(display, 4, 26, frame.screen_name, 1); // 8x8
+
+    const GAP: i32 = 4;
+    const SIGNAL_SCALE: i32 = 2;
+
+    // rocket cluster: payload icon, link signal, PAYLOAD battery -- the
+    // voltage the rocket radios down, not the handheld's own battery.
+    let rocket_x: i32 = 160;
+    let rocket_signal = rocket_x + icons::ROCKET_W as i32 + GAP;
+    let rocket_batt = rocket_signal + icons::SIGNAL_W as i32 * SIGNAL_SCALE + GAP;
+
+    icons::draw_rocket(display, rocket_x, 4, 1);
+    icons::draw_signal(display, rocket_signal, 4, frame.rssi, SIGNAL_SCALE);
+    icons::draw_battery(display, rocket_batt, 4, frame.payload_batt(), BinaryColor::On);
+    if frame.payload_charging() {
+        icons::draw_bolt(display, rocket_batt + icons::BATT_W + 2, 4, 1);
+    }
+
+    // handheld's own battery -- separate from the rocket cluster above, or
+    // it silently overwrites the one reading we have for the ground unit.
+    icons::draw_ground(display, 315, 4, 1);
+    text(display, 330, 4, "HH", 1);
+    icons::draw_battery(display, 330, 14, frame.my_batt, BinaryColor::On);
+    if frame.my_charging {
+        icons::draw_bolt(display, 330 + icons::BATT_W + 2, 14, 1);
+    }
+}

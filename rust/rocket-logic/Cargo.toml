@@ -1,0 +1,18 @@
+[package]
+name = "launchcast-rocket-logic"
+version = "0.1.0"
+edition = "2021"
+description = "LaunchCast rocket payload hardware-free logic (port of rocket/code.py's FlightState)"
+license = "Apache-2.0"
+
+[lib]
+name = "launchcast_rocket_logic"
+path = "src/lib.rs"
+
+# Same rationale as launchcast-common / launchcast-ground-logic: no_std/
+# alloc-free so it builds for thumbv6m-none-eabi once launchcast-rocket
+# (not yet started) wires it to real sensors, but every test here runs on
+# the host with no hardware involved.
+[dependencies]
+launchcast-common = { path = "../common" }
+libm = "0.2"

@@ -19,5 +19,6 @@ rec {
     git # how you running this if you don't already have git??
     gnumake # control the generation of non-source files from sources
     python # python with necessary packages; see above
+    gcc # linker for host-target `cargo test` (rustc needs `cc` on PATH)
   ];
 }

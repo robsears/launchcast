@@ -1,0 +1,18 @@
+[package]
+name = "launchcast-common"
+version = "0.1.0"
+edition = "2021"
+description = "LaunchCast shared wire packet format (port of common/packet.py)"
+license = "Apache-2.0"
+
+[lib]
+name = "launchcast_common"
+path = "src/lib.rs"
+
+# This crate needs to build for both the host (unit tests) and
+# thumbv6m-none-eabi (both boards' firmware) without an allocator or an OS.
+# `libm` is the standard no_std stand-in for the f32 math (round()) that
+# `core` doesn't provide without `std` -- it's pure Rust, no_std, and has no
+# further dependencies of its own.
+[dependencies]
+libm = "0.2"

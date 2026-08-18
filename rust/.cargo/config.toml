@@ -1,0 +1,24 @@
+# Lives at the WORKSPACE ROOT deliberately, not in rust/ground/.cargo/ --
+# Cargo discovers .cargo/config.toml by walking UP from the invocation
+# directory (or --manifest-path), never down into subdirectories. Every
+# `cargo build`/`clippy` in this session runs from `rust/` (e.g. `cargo
+# build -p launchcast-ground --target thumbv6m-none-eabi`), so a config
+# file under `rust/ground/.cargo/` was silently never discovered -- the
+# `-Tlink.x`/`-Tdefmt.x` rustflags never applied, and the resulting
+# "successful" builds produced a non-bootable binary (entry point 0x0, no
+# vector table) that happened not to hard-error. Caught only when
+# `elf2uf2-rs` refused to convert it ("entry point is not in mapped part
+# of file") -- `cargo build`/`clippy` alone do not catch this class of bug.
+#
+# Scoped to `[target.thumbv6m-none-eabi]` rather than a workspace-wide
+# `[build] target`, so it only affects `ground` (and the future `rocket`
+# firmware crate) -- `common`/`ground-logic`/`rocket-logic` still default
+# to the host target for `cargo test`.
+[target.thumbv6m-none-eabi]
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+[env]
+DEFMT_LOG = "info"
