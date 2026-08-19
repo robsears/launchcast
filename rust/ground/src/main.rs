@@ -104,7 +104,7 @@ const DISPLAY_PERIOD_MS: u64 = 500;
 /// *this* board actually took, without needing to trust "I definitely
 /// just flashed it." Bump by hand on any flash meant to be
 /// distinguishable from the last one.
-pub const FIRMWARE_VERSION: u8 = 1;
+pub const FIRMWARE_VERSION: u8 = 2;
 
 /// Dispatched (not raw) button events only -- taps/holds, not every GPIO
 /// edge -- so this channel only carries the handful of events a human

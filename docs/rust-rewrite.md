@@ -1209,6 +1209,44 @@ locks this in. Re-ran the fix against the actual pulled dump: the bogus
 2-record sessions. Full runbook for the whole retrieval process, including
 this finding: `docs/flight-log-retrieval.md`.
 
+### 2026-08-19 -- open-items triage; FIRMWARE_VERSION bumped to 2
+
+Went through the outstanding list with the user; most of it closed out by
+user call rather than further engineering:
+- Double-tap RESET not working on the rocket -- accepted as-is. BOOT and
+  RESET are adjacent, equally accessible physical buttons, so BOOT+RESET
+  costs nothing over RESET+RESET. Not pursuing further.
+- Same latent gap on the ground station -- not pursuing.
+- Cold-boot-on-battery -- **confirmed fixed on both boards**, no RESET
+  needed, this is now the expected/normal boot behavior. (Was still
+  listed as rocket-unconfirmed as of this doc's last update to that
+  section; now confirmed on both.)
+- BOOST->APOGEE->LANDED on a real motor flight, and achieved loop/sample
+  rate -- both explicitly deferred to actual field testing, not something
+  more bench work or code changes can resolve. Sample rate data point
+  from bench "flights" (shaking the board to trigger real thresholds):
+  ~150-200Hz (153 avg / 165 median / 197 mode) -- consistent with the
+  200Hz loop cap this session's engineering aimed for.
+- Ground-test protocol (shake/ejection-charge/etc.) -- deferred to actual
+  rocket assembly (currently payload-tube-only); power-duration test not
+  wanted; radio range walk called out as worth doing.
+- NAR safety code / motor instructions / launch-site rules -- handled
+  offsite, removed from the list entirely.
+- GPS overland-range anomaly -- treated as satisfactorily mitigated under
+  Rust; the CircuitPython-era finding is no longer relevant (that
+  implementation is prototyping history at this point, not something
+  worth chasing further).
+
+Net result: `FIRMWARE_VERSION` bump was the only remaining actionable
+software item. Bumped `1` -> `2` on both `rocket/src/main.rs` and
+`ground/src/main.rs` -- both boards have changed substantially since `1`
+was set (BMP580 fix, GPS averaging, cold-boot fix, RECOVER, log
+retrieval on the rocket side; FLIGHT screen rewrite, battery bucketing,
+cold-boot fix, RECOVER dispatch on the ground side), so leaving the
+version at `1` would have been actively misleading, not just stale.
+Build/clippy clean, both UF2s regenerated; not yet confirmed on
+hardware via DIAG/CONTROLLER screens as of this entry.
+
 ## Why
 
 Two distinct problems, both experienced directly this session, not

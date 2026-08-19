@@ -81,7 +81,7 @@ static I2C_BUS: StaticCell<RefCell<I2c<'static, embassy_rp::peripherals::I2C1, e
 /// it." Bump by hand on any flash meant to be distinguishable from the
 /// last one -- a plain counter, not a semver, since that's all this
 /// needs to answer "is this the build I think it is."
-const FIRMWARE_VERSION: u8 = 1;
+const FIRMWARE_VERSION: u8 = 2;
 
 /// Matches `code.py`'s `CHIRP_MS`.
 const CHIRP_MS: u32 = 1000;
