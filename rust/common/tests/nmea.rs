@@ -1,4 +1,4 @@
-use launchcast_ground_logic::{checksum, parse_rmc, NmeaLineReader};
+use launchcast_common::nmea::{checksum, parse_rmc, NmeaLineReader};
 
 // The textbook example sentence used across NMEA 0183 references
 // (including Wikipedia's NMEA 0183 article) -- checksum 6A is a known

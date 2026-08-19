@@ -12,7 +12,6 @@ pub mod icons;
 pub mod imu;
 pub mod link;
 pub mod nav;
-pub mod nmea;
 pub mod nogo;
 pub mod units;
 
@@ -23,5 +22,10 @@ pub use icons::{battery_level, battery_percent, signal_level, signal_percent};
 pub use imu::accel_magnitude_g;
 pub use link::{link_status, telemetry_missing, LinkStatus, LINK_LOST_MS, LINK_STALE_MS, TELEMETRY_MISSING_MS};
 pub use nav::{bearing_deg, compass_point, haversine_m, relative_arrow, EARTH_R_M};
-pub use nmea::{checksum, parse_rmc, NmeaLineReader, RmcFix};
 pub use units::{c_to_f, m_to_ft, Units};
+
+// NMEA parsing moved to `launchcast_common::nmea` -- both boards' GPS
+// need it, not just the ground station's. Re-exported here under its old
+// path so `ground`'s existing `use launchcast_ground_logic::{checksum,
+// parse_rmc, NmeaLineReader}` keeps working unchanged.
+pub use launchcast_common::nmea::{self, checksum, parse_rmc, NmeaLineReader, RmcFix};

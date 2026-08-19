@@ -125,6 +125,29 @@ static BUTTON_EVENTS: Channel<CriticalSectionRawMutex, ButtonEvent, BUTTON_EVENT
 #[entry]
 fn main() -> ! {
     let p = embassy_rp::init(Config::default());
+
+    // Cold-boot-on-battery-only fix (reported 2026-08-18): powering on
+    // from the LiPo alone never got core1 (buttons+display) running --
+    // nothing ever reached the screen -- while core0 (radio) came up
+    // fine every time, confirmed alive via its own heartbeat LED blink.
+    // A reset-button press (not a power cycle) then fixed it every time.
+    // That specific signature -- reset fixes it, fresh power-on doesn't
+    // -- points at a power-rail settling race, not a logic bug: a reset
+    // only restarts code execution, it doesn't recycle power, so by the
+    // time it fires the rail has already been up and stable for a few
+    // seconds; the exact same code then succeeds. LiPo boost-converter
+    // rails commonly ramp up slower/less cleanly than USB's regulated 5V,
+    // so firmware can start configuring hardware (here: PIO/SPI for the
+    // display, on core1) before the rail is fully settled. Fixed by
+    // giving the rail a moment before touching any peripheral, on either
+    // core -- applied once here rather than guessing it's core1
+    // specifically, since a 100ms cold-boot delay is free at this
+    // project's timescales either way. cortex_m::asm::delay (not
+    // embassy_time::Timer) because no async executor is running yet to
+    // poll one. Unverified against real hardware -- next thing to
+    // confirm once this is flashed and tested on battery power.
+    cortex_m::asm::delay(12_500_000); // ~100ms at the 125MHz clock init() just configured
+
     defmt::info!("launchcast-ground: boot ok, spawning core1 (buttons + display)");
 
     spawn_core1(

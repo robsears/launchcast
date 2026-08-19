@@ -2,11 +2,12 @@
 //! to the rocket's last known fix on the RECOVERY screen. Port of the GPS
 //! half of `Hardware`/`code.py`'s main loop.
 //!
-//! Sentence parsing (`NmeaLineReader`, `parse_rmc`, `checksum`) lives in
-//! `ground-logic`, hardware-free and host-tested (see its module docs) --
+//! Sentence parsing (`NmeaLineReader`, `parse_rmc`, `checksum`,
+//! `framed_command`) lives in `common::nmea`, shared with the rocket's
+//! own GPS (`rocket/src/gps.rs`) and hardware-free/host-tested there --
 //! this module is only the I2C transport, both the read loop and the
 //! `PMTK*` init writes that enable SBAS/WAAS correction on this GPS to
-//! match `rocket/code.py`'s (see `ground-logic`'s docs for why the
+//! match `rocket/code.py`'s (see `common::nmea`'s docs for why the
 //! accuracy gap that motivated this existed at all).
 //!
 //! Published fixes are a rolling [`FixAverage`] over
@@ -25,7 +26,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use heapless::String;
-use launchcast_ground_logic::{checksum, parse_rmc, FixAverage, NmeaLineReader};
+use launchcast_ground_logic::{parse_rmc, FixAverage, NmeaLineReader};
+use launchcast_common::nmea::framed_command;
 
 /// Confirmed via CLAUDE.md and `adafruit_gps`'s own default -- the
 /// PA1010D's fixed I2C address.
@@ -58,19 +60,6 @@ pub struct MyFix {
 /// read, matching `code.py`'s own `if hw.gps.has_fix:` gate (which only
 /// ever assigns `my_lat`/`my_lon`, never clears them).
 pub static MY_GPS: Mutex<CriticalSectionRawMutex, Option<MyFix>> = Mutex::new(None);
-
-/// Frame a raw PMTK payload (e.g. `"PMTK301,2"`) into the full command
-/// bytes the chip expects: `"$PAYLOAD*XX\r\n"`, checksum computed the
-/// same way incoming sentences are verified (see `ground-logic::nmea`).
-fn framed_command<const N: usize>(payload: &str) -> String<N> {
-    let mut s: String<N> = String::new();
-    let _ = s.push('$');
-    let _ = s.push_str(payload);
-    let _ = s.push('*');
-    let _ = core::fmt::write(&mut s, format_args!("{:02X}", checksum(payload)));
-    let _ = s.push_str("\r\n");
-    s
-}
 
 fn send_command(i2c: &mut I2c<'static, I2C1, Blocking>, payload: &str) {
     let cmd: String<32> = framed_command(payload);

@@ -12,6 +12,8 @@
 //! thumbv6m-none-eabi as well as the host.
 #![cfg_attr(not(test), no_std)]
 
+pub mod nmea;
+
 // --- Protocol identity -------------------------------------------------------
 
 /// Binary 10100101; alternating bits and its own bit-reverse. Confirms a

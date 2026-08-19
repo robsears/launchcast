@@ -1,36 +1,42 @@
-//! Hardware-free NMEA 0183 handling for the ground station's own GPS
-//! (PA1010D over I2C). Two pieces, both pure logic with no I2C dependency
+//! Hardware-free NMEA 0183 handling for the PA1010D GPS over I2C -- both
+//! boards have one (payload and handheld), and both run the same chip
+//! with the same CircuitPython library today (`adafruit_gps`), so this
+//! lives in `common` rather than being duplicated or owned by just one
+//! board's `-logic` crate. Originally written for the ground station only
+//! (see the bug-log entries in `docs/rust-rewrite.md` this module's docs
+//! used to point to) and relocated here once the rocket port needed the
+//! exact same parsing. Two pieces, both pure logic with no I2C dependency
 //! so both are host-testable:
 //!
 //! - [`NmeaLineReader`]: assembles raw I2C bytes into complete sentence
-//!   lines, replicating `adafruit_gps`'s (the CircuitPython library
-//!   `ground/code.py` uses) exact padding-filter rule for the PA1010D's
-//!   I2C "streaming" protocol: a bare `0x0A` that doesn't follow `0x0D`
-//!   is filler (the module pads idle I2C reads with linefeeds when it has
-//!   nothing new to send), not a real line terminator, and must be
-//!   dropped rather than treated as an empty line.
+//!   lines, replicating `adafruit_gps`'s exact padding-filter rule for
+//!   the PA1010D's I2C "streaming" protocol: a bare `0x0A` that doesn't
+//!   follow `0x0D` is filler (the module pads idle I2C reads with
+//!   linefeeds when it has nothing new to send), not a real line
+//!   terminator, and must be dropped rather than treated as an empty line.
 //! - [`parse_rmc`]: decodes a `$..RMC` sentence (fix status, lat/lon,
 //!   speed over ground, track angle) -- the one sentence type that alone
-//!   covers everything `ground/code.py`'s main loop reads off its own
-//!   GPS (`latitude`, `longitude`, `speed_knots`, `track_angle_deg`), so
-//!   nothing else is parsed.
+//!   covers everything either board's main loop reads off its own GPS,
+//!   so nothing else is parsed.
 //!
-//! `ground/code.py` also sends `PMTK314`/`PMTK220` to configure which
-//! sentences the chip emits and at what rate -- not sent by this port:
-//! PA1010D/MTK3339-family chips emit RMC by factory default, and MTK
-//! sentence-output configuration is session-only (reset by a power
-//! cycle) unless separately told to persist, so skipping these two just
-//! means relying on the chip's own default output rather than Python's
+//! Neither board sends `PMTK314`/`PMTK220` (which sentences the chip
+//! emits, and at what rate) from this Rust port: PA1010D/MTK3339-family
+//! chips emit RMC by factory default, and MTK sentence-output
+//! configuration is session-only (reset by a power cycle) unless
+//! separately told to persist, so skipping these two just means relying
+//! on the chip's own default output rather than the original Python's
 //! explicit one.
 //!
 //! `PMTK313`/`PMTK301` (enable SBAS search / DGPS correction source =
 //! WAAS) are a different matter -- those aren't sentence-output settings
-//! at all, they're accuracy config, and skipping them left this GPS
-//! running uncorrected while the rocket's (which still runs
-//! `rocket/code.py`, unchanged) sends both at boot. That asymmetry showed
-//! up as a large (60-120ft) gap between two at-rest fixes that should've
-//! read the same. [`checksum`] plus the framing in `ground/src/gps.rs`
-//! sends both, closing the gap with the existing, tested Python behavior.
+//! at all, they're accuracy config. The ground station's Rust port
+//! skipped them at first (mistaking them for sentence-output config too),
+//! which left its GPS running uncorrected while the rocket's (still
+//! `rocket/code.py` at the time, which does send both) had WAAS the whole
+//! time -- that asymmetry showed up as a large (60-120ft) gap between two
+//! at-rest fixes that should've read the same. [`checksum`] plus the
+//! framing in each board's own GPS module sends both now, closing the gap
+//! with the existing, tested Python behavior.
 
 use heapless::String;
 
@@ -86,10 +92,24 @@ impl<const N: usize> NmeaLineReader<N> {
 
 /// XOR checksum of an NMEA sentence body (the bytes between `$` and `*`).
 /// Used both to verify incoming sentences ([`parse_rmc`]) and to frame
-/// outgoing `PMTK*` configuration commands (see `ground/src/gps.rs`) --
-/// the same algorithm either direction.
+/// outgoing `PMTK*` configuration commands ([`framed_command`]) -- the
+/// same algorithm either direction.
 pub fn checksum(body: &str) -> u8 {
     body.bytes().fold(0u8, |acc, b| acc ^ b)
+}
+
+/// Frame a raw PMTK payload (e.g. `"PMTK301,2"`) into the full command
+/// bytes the chip expects: `"$PAYLOAD*XX\r\n"`. Shared by both boards'
+/// GPS init (`ground/src/gps.rs`, `rocket/src/gps.rs`) -- each board
+/// still owns the actual I2C write, this just builds the bytes.
+pub fn framed_command<const N: usize>(payload: &str) -> String<N> {
+    let mut s: String<N> = String::new();
+    let _ = s.push('$');
+    let _ = s.push_str(payload);
+    let _ = s.push('*');
+    let _ = core::fmt::write(&mut s, format_args!("{:02X}", checksum(payload)));
+    let _ = s.push_str("\r\n");
+    s
 }
 
 /// A decoded `$..RMC` sentence.

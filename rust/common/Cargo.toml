@@ -16,3 +16,7 @@ path = "src/lib.rs"
 # further dependencies of its own.
 [dependencies]
 libm = "0.2"
+# For NmeaLineReader's line-assembly buffer (nmea.rs, shared by both
+# boards' GPS -- see nmea.rs's module docs). Version matches what's
+# already resolved transitively elsewhere in the workspace.
+heapless = "0.9"
