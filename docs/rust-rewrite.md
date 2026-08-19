@@ -780,16 +780,107 @@ not worth it -- the rocket is never charging on a launch pad, which was
 the actual scenario this whole thread started from; `frame.my_charging`
 stays hardcoded `false` (unchanged from before).
 
-Not started: the rocket/payload firmware crate itself (only its
-hardware-free logic exists so far, in `rocket-logic`). The current
-CircuitPython implementation (`common/packet.py`, `rocket/code.py`,
-`ground/code.py`, `ground/hold_tracker.py`, `ground/icons.py`, and the rest
-of `ground/`) remains **working, hardware-validated, and the behavioral spec
-to port against** — not a prototype to throw away. ARM/DISARM has been
-confirmed end-to-end over the real radio link. Treat a Rust port as
-*reimplementing known-good, tested behavior on a different runtime*, not a
-redesign from scratch. `tests/` (155 pytest tests) documents that behavior
-precisely enough to translate into Rust unit tests as each piece is ported.
+### 2026-08-18 -- rocket/payload firmware crate: first full build
+
+`rust/rocket` (crate `launchcast-rocket`) exists now, builds clean, clippy-
+clean (`-D warnings`, zero warnings, not just zero errors), and links to a
+valid UF2 -- **not yet flashed or tested on real hardware.** Same
+"reimplementing known-good, tested behavior on a different runtime, not a
+redesign" discipline as the ground port, checked against the actual
+Python driver sources where they exist locally (`adafruit_bmp5xx.py`,
+`adafruit_lis3mdl.py`, both under `~/.local/share/circup/...`), not
+re-derived from datasheets from scratch.
+
+Ecosystem check (same practice as `embassy-rp`/`lora-phy` originally):
+`lsm6dsox` crate adopted for the IMU (mature, embedded-hal 1.0 blocking,
+actively maintained, OLFL-1.3 license -- a legitimate Apache-2.0-style
+permissive license from Fraunhofer IML, not one of the common SPDX names
+but not copyleft either). BMP580 and LIS3MDL hand-rolled instead: the
+only BMP580 crate available (`bmp5xx`) is 6 weeks old with 91 downloads
+and async-only (would force a bus-mode mismatch against `lsm6dsox`'s
+blocking-only API on the same shared bus); the LIS3MDL crates are both
+years-unmaintained and pre-`embedded-hal-1.0`.
+
+**Real surprise found integrating `lsm6dsox`**: its `Accelerometer` trait
+impl (`accel_norm()`) returns **g, not m/s²** despite the `accelerometer`
+crate's trait convention -- confirmed by checking the crate's own
+sensitivity constant (`0.000122` at `Accel4g`, which is the datasheet's
+mg/LSB spec, not an m/s² figure), not assumed from the trait's label.
+Trusting the label would have fed g-unit values into `FlightState`
+(expects m/s², divides by gravity again internally) -- silently wrong by
+~9.8x, specifically during boost detection. Worked around by reading raw
+counts (`accel_raw()`/`angular_rate_raw()`) and scaling by hand against
+the documented per-LSB sensitivity instead of trusting either "normalized"
+method -- see `rocket-logic/src/imu.rs`'s docs.
+
+Sensor-driver scope, deliberately trimmed against what's actually used,
+not built out to match Python's full surface: LIS3MDL is presence-check
+only (`rocket/code.py`'s main loop never actually reads `hw.mag`, and the
+wire telemetry format has no field for it at all); GPS satellite count is
+always 0 (only `$..RMC` is parsed, same scope as the ground station's own
+GPS -- no `$..GGA` parser for one non-critical diagnostic field).
+
+Two real, user-confirmed decisions made along the way, not defaulted
+silently:
+- **DISARM-without-boost rewinds to this arm cycle's start, not a full-
+  log wipe** like `rocket/code.py`'s literal `open(path, "wb")`. Checked
+  against the actual implementation, not just the docstring's stated
+  intent ("that arm cycle produced no flight data worth keeping") --
+  since `flight.bin` persists across reboots (opened in append mode),
+  the literal Python behavior would wipe an *earlier real flight's* data
+  too if a later bench DISARM ever followed it. User call, 2026-08-18:
+  rewind only.
+- **`Sensor::CHG` hardcoded to 0** for now -- same missing-VBUS-detection
+  finding as the ground station's own charging status, but here it feeds
+  a real safety gate (the ground station's NOGO-while-charging ARM
+  refusal) rather than a cosmetic icon. User call, 2026-08-18: ship
+  without it anyway rather than take on a full USB device stack; means
+  that gate won't actually trigger via telemetry yet. Also noted: even
+  Python's `usb_connected` only detects an active USB *data* connection
+  to a host, not raw charging current, so it wouldn't catch a rocket
+  charging from a dumb USB power brick either -- imperfect parity either way.
+
+**Raw-partition flash log** (`rocket-logic/src/flash_log.rs` for the
+record format, `rocket/src/flash_log.rs` for the flash I/O): the piece
+that took the most real design work this session. Fixed 48-byte records
+(magic + version + 45-byte payload matching `code.py`'s own `LOG_FMT` +
+checksum), self-describing so a boot-time scan finds the resume point
+without a separate persistent write-pointer header to maintain (and its
+own torn-write problem). Flush trigger: 500 entries or 5 seconds,
+whichever first (user-specified, 2026-08-18 -- covers a full boost+coast
+phase for the largest motor this project flies, ~2.8s worst case, without
+ever flushing mid-phase). Double-buffered in SRAM (`BATCHES[2]`, ~24KB
+each) so core1's sampling never blocks on core0's flash write -- a single
+shared buffer behind one mutex would have reintroduced exactly the stall
+this whole scheme exists to avoid, the moment core1's next sample landed
+while core0 still held the lock. Every arm cycle's data starts at a
+sector-aligned offset specifically so the DISARM-rewind's erase can never
+touch an earlier flight's data living in the same sector.
+
+**Dual-core split, confirmed against source, not assumed**: `embassy-rp`'s
+flash driver (`src/flash.rs`) only allows `blocking_erase`/`blocking_write`
+to be called from core0 (`pac::SIO.cpuid()` checked, `Error::InvalidCore`
+otherwise) and forcibly pauses core1 for the duration of every call
+(`multicore::pause_core1()`, a real blocking FIFO handshake, not just a
+comment) -- so core0 ended up owning both radio *and* the flash-flush,
+core1 owns the I2C bus + flight-state machine + RAM buffering only, per
+the revised Strawman architecture above. Radio TX/RX is deliberately
+phase-agnostic (one unchanging loop covers the whole flight) since the
+flight-state machine already refuses ARM outside IDLE and DISARM outside
+ARMED with no path back once boosted -- core0 doesn't need to know or
+care what phase the flight is in for that to be safe.
+
+GPS's NMEA parsing (`checksum`/`framed_command`/`parse_rmc`/
+`NmeaLineReader`) moved from `ground-logic` to `common` this session too
+-- both boards' GPS need it now, not just the ground station's (re-
+exported from `ground-logic` under its old path so nothing there had to
+change).
+
+Not yet done: flashing/testing on real hardware (the actual point where
+the ground port's own bug list -- sync word, DIO1, stack size -- came
+from; expect this one to have its own such list once it's on real
+hardware), and the wireless flight-log-review feature discussed and
+explicitly deferred until after a first real flight with local logging.
 
 ## Why
 

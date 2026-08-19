@@ -1,0 +1,71 @@
+[package]
+name = "launchcast-rocket"
+version = "0.1.0"
+edition = "2021"
+description = "LaunchCast rocket payload firmware (Rust rewrite)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "launchcast-rocket"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+launchcast-common = { path = "../common" }
+launchcast-rocket-logic = { path = "../rocket-logic" }
+
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+# critical-section-impl: required whenever embassy-sync primitives (our
+# inter-core Mutex/Channels) are shared across cores -- same reasoning as
+# `ground`.
+embassy-rp = { version = "0.10", features = ["rp2040", "time-driver", "critical-section-impl"] }
+embassy-sync = "0.8"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+defmt = "0.3"
+defmt-rtt = "0.4"
+static_cell = "2"
+# thumbv6m (Cortex-M0+) has no native atomic CAS -- same reasoning as
+# `ground`.
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+# "async" feature: needed for ExclusiveDevice to wrap an async SPI (the
+# radio's SPI1, driven with DMA) as an embedded-hal-async SpiDevice, which
+# is what lora-phy requires. Also used directly by our own BMP580/LIS3MDL
+# drivers' blocking embedded-hal 1.0 I2C trait bound.
+embedded-hal = "1"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+embedded-hal-async = "1"
+
+# RFM95/SX1276 LoRa radio -- same pinned commit as `ground`, so both
+# boards' radio stacks stay identical. See ground/Cargo.toml for the full
+# rationale (custom sync word support not in the 3.0.1 crates.io release).
+lora-phy = { git = "https://github.com/lora-rs/lora-rs", rev = "5cd9cb3097770f6d976de012b2265676956cadc7", features = [
+  "defmt-03",
+] }
+
+# ST LSM6DSOX IMU (accel+gyro). Blocking embedded-hal 1.0, actively
+# maintained (Fraunhofer IML), no_std/no-alloc -- see docs/rust-rewrite.md
+# for the ecosystem check that picked this over hand-rolling. BMP580 and
+# LIS3MDL are hand-rolled instead (no comparably mature crate exists for
+# either) -- see bmp580.rs/lis3mdl.rs.
+lsm6dsox = "2.1"
+
+heapless = "0.9"
+libm = "0.2"
+# For PWM Config::divider (fixed-point) -- version matches what's already
+# resolved transitively via embassy-rp's own dependency on it.
+fixed = "1"
+# RGB8, for embassy-rp's own first-party PIO WS2812 driver
+# (pio_programs::ws2812) -- not a third-party NeoPixel crate, just the
+# color type that driver's API is expressed in terms of.
+smart-leds = "0.4"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"

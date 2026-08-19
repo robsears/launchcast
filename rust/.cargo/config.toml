@@ -11,9 +11,9 @@
 # of file") -- `cargo build`/`clippy` alone do not catch this class of bug.
 #
 # Scoped to `[target.thumbv6m-none-eabi]` rather than a workspace-wide
-# `[build] target`, so it only affects `ground` (and the future `rocket`
-# firmware crate) -- `common`/`ground-logic`/`rocket-logic` still default
-# to the host target for `cargo test`.
+# `[build] target`, so it only affects `ground` and `rocket` -- `common`/
+# `ground-logic`/`rocket-logic` still default to the host target for
+# `cargo test`.
 [target.thumbv6m-none-eabi]
 rustflags = [
   "-C", "link-arg=-Tlink.x",

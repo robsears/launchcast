@@ -7,7 +7,13 @@
 //! real hardware.
 #![cfg_attr(not(test), no_std)]
 
+pub mod bmp580;
+pub mod buzzer;
+pub mod flash_log;
 pub mod flight_state;
+pub mod imu;
+pub mod lis3mdl;
+pub mod pixel;
 
 pub use flight_state::{
     accel_magnitude, FlightState, APOGEE_VEL_MPS, BOOST_MIN_MS, BOOST_THRESHOLD_G,
