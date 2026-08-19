@@ -876,11 +876,172 @@ GPS's NMEA parsing (`checksum`/`framed_command`/`parse_rmc`/
 exported from `ground-logic` under its old path so nothing there had to
 change).
 
-Not yet done: flashing/testing on real hardware (the actual point where
-the ground port's own bug list -- sync word, DIO1, stack size -- came
-from; expect this one to have its own such list once it's on real
-hardware), and the wireless flight-log-review feature discussed and
-explicitly deferred until after a first real flight with local logging.
+Not yet done (at the time the entry above was written): flashing/testing
+on real hardware, and the wireless flight-log-review feature, explicitly
+deferred until after a first real flight with local logging.
+
+### 2026-08-18 -- first real flight hardware, both boards
+
+**Ground station**: cold-boot-on-battery-only never got core1 (buttons +
+display) running -- nothing reached the screen -- while core0 (radio)
+came up fine every time, confirmed alive via its own heartbeat LED. A
+*reset* button press (not a power cycle) fixed it every time. That
+signature -- reset fixes it, fresh power-on doesn't -- points at a power-
+rail settling race, not a logic bug: reset only restarts code execution,
+it doesn't recycle power, so by the time it fires the rail's already been
+up and stable for a few seconds, and the same code then succeeds. LiPo
+boost-converter rails commonly ramp up slower/less cleanly than USB's
+regulated 5V. Fixed with a ~100ms `cortex_m::asm::delay` right after
+clock init, before either core touches a peripheral -- confirmed working
+by the user on real hardware.
+
+**Rocket**: flashed via double-tap-reset into the UF2 bootloader (not
+`import storage` -- that's for CircuitPython's own host-write permission
+dance, unrelated to flashing a new `.uf2` at all, which needs the ROM
+bootloader's own always-writable `RPI-RP2` drive instead). Broadcasting
+immediately, CHIRP and ARM/DISARM both confirmed working over the real
+link on first try.
+
+Two real fixes from that first flight:
+- **Battery percent formula rescaled** (153.75, was 123): the actual
+  battery peaked around 4.0V/~80% on the original curve -- confirmed not
+  a bug (4.00V's 79.1% on the original formula matches the observed ~80%
+  almost exactly) but this board's charge IC capping below the standard
+  4.2V LiPo-full voltage, a common deliberate longevity tradeoff. A
+  battery that structurally can't reach 100% reads as "broken" forever,
+  which is worse than treating this hardware's real achievable ceiling as
+  100%.
+- **`fw_version` field added** to telemetry (byte 39, a repurposed
+  `cam_disk` -- see above): confirms a deploy actually took from
+  telemetry alone. Shown on the ground station's DIAG screen.
+
+Investigated but not resolved: a reported ~46°F temperature reading.
+Traced the entire pipeline -- BMP580 register addresses, config byte
+math, decode formula, byte ordering (checked directly against
+`adafruit_register.register_bits`'s source, not inferred), the shared
+wire pack/unpack (already tested), the ground station's C->F conversion
+-- and found no bug anywhere in it; also confirmed (via `grep`) there's
+no accidental unit conversion happening rocket-side at all. Root cause
+still open -- needs a live hardware data point (does the reading change
+at all; what does altitude look like) to narrow further.
+
+~~Confirmed still correct as designed, not bugs: the rocket's GPS does
+*not* do the ground station's rolling-average smoothing~~ -- superseded
+2026-08-19, see below: the user did want averaging added, just gated by
+flight phase rather than always-on. The NeoPixel
+status-color-by-flight-state feature the user asked about already
+existed (ported from `code.py`'s `PIXEL_FOR_STATE` in the original
+rocket-port pass) -- current colors: BOOT dim blue, IDLE dim yellow,
+ARMED green, BOOST orange, COAST cyan, APOGEE magenta, DESCENT teal,
+LANDED red. Not the same mapping the user described from memory (green
+for IDLE, yellow for ARMED, plus a NOGO color, which doesn't correspond
+to any rocket-side flight state at all -- NOGO is a ground-station-side
+judgment about the rocket's telemetry, not something the rocket itself
+knows to indicate) -- open whether to change it, not decided.
+
+### 2026-08-19 -- temperature bug root-caused; rocket-side GPS averaging added
+
+**Temperature bug, root-caused.** The user's follow-up supplied the one
+fact static analysis of the pipeline couldn't produce on its own: this
+exact sensor read *correctly* under the CircuitPython firmware, on the
+same hardware, and only went wrong after the Rust port -- ruling out an
+environmental/hardware explanation and pointing squarely at the BMP580
+driver port. Found it: the initial Rust driver collapsed several of
+`adafruit_bmp5xx`'s individual `RWBits`/`RWBit` property-setter writes
+into one precomputed "final byte" write per register (`OSR_CONFIG`,
+`DSP_IIR`, `DSP_CONFIG`, `ODR_CONFIG`), on the assumption that every bit
+this driver doesn't explicitly touch is already 0 after a soft reset.
+That assumption was wrong somewhere in the sequence -- likely enough to
+have kept the chip from ever actually reaching continuous NORMAL-mode
+measurement, which would explain a frozen/wrong reading rather than a
+merely-inaccurate one. Fixed by switching to genuine per-field
+read-modify-write, matching what the Python descriptors actually do on
+the wire, field-by-field in the same call order `__init__` makes them --
+including implementing (not skipping, as the first pass had) the
+conditional "force back to STANDBY first" branch in the mode-transition
+sequence. See `rocket-logic/src/bmp580.rs` and `rocket/src/bmp580.rs`'s
+docs for the byte-level detail. Build/clippy/host-test clean; **not yet
+confirmed against real hardware** -- needs a reflash-and-observe cycle
+before this can be called done.
+
+**Rocket-side GPS averaging, added.** User's explicit spec: average
+while IDLE or LANDED; don't average once BOOST/COAST/DESCENT ("in
+motion") is detected. `FixAverage` (previously ground-only) moved to
+`common` so both boards' GPS modules can share it, mirroring the earlier
+`nmea` relocation. `rocket/src/gps.rs` gained a `FLIGHT_STATE: AtomicU8`
+static, published every loop tick by `flight_task` (`main.rs`) -- both
+tasks share core1's single-threaded executor, so `Relaxed` ordering is
+enough, no real race exists. `should_average(state)` extends the user's
+two named states to the "stationary" side of every state (BOOT, IDLE,
+ARMED, LANDED) and the "in motion" side to the rest (BOOST, COAST,
+APOGEE, DESCENT) -- the user only named IDLE/LANDED and BOOST/COAST/
+"RECOVERY" (mapped to DESCENT, the only flight-state name that fits)
+explicitly, but stated the actual criterion as "when we know it's in
+motion," which this applies uniformly rather than leaving BOOT/ARMED as
+an unspecified gap. Worth flagging back to the user: ARMED is currently
+grouped with "stationary" (pre-launch, sitting on the pad, same as IDLE)
+-- if that's wrong, the fix is a one-line change to `should_average`'s
+`matches!`. On a transition between stationary and in-motion, the
+accumulator resets rather than carrying over -- otherwise a window that
+straddled liftoff or landing could publish an average blending airborne
+and stationary samples. `has_fix` still flips immediately on every
+sentence regardless of averaging state (unchanged from before this
+change) -- only `lat`/`lon` go through the average; that preserves this
+module's original deliberate difference from the ground station (no
+latching through a lost fix). ~~Averaging window matches the ground
+station's, 5000ms.~~ -- superseded same day, see below: the windowed
+design didn't survive first real-hardware feedback. Build/clippy/host-test
+clean across the whole workspace; not yet flight/bench-tested.
+
+### 2026-08-19 -- GPS averaging rewritten as a ring buffer; FLIGHT screen layout changes
+
+**GPS averaging: window-reset scheme replaced with a fixed-capacity ring
+buffer.** Real-hardware feedback on the above: distance-to-rocket did
+settle to a stable, accurate reading, but took a few real minutes after
+cold start to get there. The 5-second reset-and-snapshot window itself
+wasn't actually capable of causing multi-minute lag (each window only
+ever held a few seconds of samples before being discarded), so the
+likelier explanation is GPS-chip-level convergence (WAAS/SBAS lock,
+ephemeris acquisition) rather than a software windowing artifact -- but
+the user's proposed fix (keep the most recent 10-20 raw samples instead
+of a periodic running average) is still a real improvement in its own
+right: it publishes a continuously-updated mean instead of a chunky
+once-per-window snapshot, and it sheds a stale run in a bounded number of
+samples rather than however long is left until the next window boundary.
+`common::fix_average::FixAverage` rewritten around a `WINDOW_SAMPLES =
+15` ring buffer (middle of the user's 10-20 suggestion) -- same public
+API (`new`/`add`/`mean`/`count`/`reset`), so both `ground/src/gps.rs` and
+`rocket/src/gps.rs` needed only their window-deadline/`Instant` bookkeeping
+removed, not a redesign. The rocket's flight-phase-transition reset (see
+above) got *more* important under this design, not less: without it, a
+stale ring buffer would sit untouched (not decaying) through an entire
+flight, since `should_average` stops feeding it samples during
+BOOST-through-DESCENT, and would otherwise take another 15 fresh samples
+after landing to fully evict the pre-flight data mixed in.
+
+**FLIGHT screen**: four layout/logic changes, all user-specified:
+- Rocket's `fw_version` (already in telemetry, see above) now shown
+  inline on the "SYSTEMS CHECK:" line (`SYSTEMS CHECK:   v{n}`) rather
+  than as a separate row -- `screen_missing.rs` (which mirrors this
+  layout when no telemetry has arrived) shows `v??` in the same spot for
+  consistency with its other placeholder fields.
+- Handheld's own firmware version (new `ground::FIRMWARE_VERSION`
+  constant, mirroring the rocket's) now shown on its own line under the
+  "CONTROLLER" title. The handheld's art glyph is already drawn at
+  `y=40`, the topmost a screen is allowed to draw (see
+  `screen_header.rs`), so it couldn't move up any further to make room --
+  the version line was inserted right under the title instead, pushing
+  GPS LOCK/BATTERY/DIST/the 3-line command log down 10px each. Checked
+  there was enough slack before `FOOTER_Y` (222) for that: there was,
+  with margin to spare.
+- Header's "HH" label (next to the handheld's own battery icon) removed;
+  the battery icon moved up into the row the label used to occupy. The
+  ground glyph immediately to its left already identifies whose battery
+  it is, same as the rocket icon does for the payload cluster next to it.
+- `battery_level`'s bucketing thresholds changed from a plain `/25`
+  (0-24/25-49/50-74/75-99/100 -> 0-4 bars) to user-specified thresholds
+  aligned to round 20% boundaries: >80% is 4 bars, >60% is 3, >40% is 2,
+  >20% is 1, 20% or under is 0 (each floor exclusive).
 
 ## Why
 

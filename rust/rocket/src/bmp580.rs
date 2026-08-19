@@ -6,11 +6,15 @@
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::i2c::I2c;
 use launchcast_rocket_logic::bmp580::{
-    decode_temp_press, DSP_CONFIG_BYTE, DSP_IIR_BYTE, INT_SOURCE_BYTE, INT_STATUS_DATA_READY_BIT,
-    INT_STATUS_POR_BIT, I2C_ADDR, ODR_CONFIG_STEP1_ODR_ONLY, ODR_CONFIG_STEP2_DEEP_DISABLED,
-    ODR_CONFIG_STEP3_MODE_NORMAL, OSR_CONFIG_BYTE, REG_CHIP_ID, REG_CMD, REG_DSP_CONFIG,
-    REG_DSP_IIR, REG_INT_SOURCE, REG_INT_STATUS, REG_ODR_CONFIG, REG_OSR_CONFIG, REG_STATUS,
-    REG_TEMP_DATA_XLSB, SOFT_RESET_CMD, STATUS_NVM_ERR_BIT, STATUS_NVM_READY_BIT, VALID_CHIP_IDS,
+    decode_temp_press, DSP_IIR_FLUSH_FORCED_MASK, DSP_IIR_FLUSH_FORCED_SHIFTED, DSP_PRESS_SHADOW_MASK,
+    DSP_PRESS_SHADOW_AFTER_SHIFTED, DSP_TEMP_SHADOW_AFTER_SHIFTED, DSP_TEMP_SHADOW_MASK, IIR_PRESS_COEFF_1_SHIFTED,
+    IIR_PRESS_MASK, IIR_TEMP_COEFF_1, IIR_TEMP_MASK, INT_SRC_DATA_READY_EN_MASK, INT_SRC_DATA_READY_EN_SHIFTED,
+    INT_STATUS_DATA_READY_BIT, INT_STATUS_POR_BIT, I2C_ADDR, ODR_DEEP_DISABLED_MASK, ODR_DEEP_DISABLED_SHIFTED,
+    ODR_MODE_MASK, ODR_MODE_NORMAL_SHIFTED, ODR_MODE_STANDBY_SHIFTED, ODR_RATE_50HZ_SHIFTED, ODR_RATE_MASK,
+    OSR_PRESS_16X_SHIFTED, OSR_PRESS_ENABLED_MASK, OSR_PRESS_ENABLED_SHIFTED, OSR_PRESS_MASK, OSR_TEMP_2X,
+    OSR_TEMP_MASK, REG_CHIP_ID, REG_CMD, REG_DSP_CONFIG, REG_DSP_IIR, REG_INT_SOURCE, REG_INT_STATUS,
+    REG_ODR_CONFIG, REG_OSR_CONFIG, REG_STATUS, REG_TEMP_DATA_XLSB, SOFT_RESET_CMD, STATUS_NVM_ERR_BIT,
+    STATUS_NVM_READY_BIT, VALID_CHIP_IDS,
 };
 
 #[derive(Debug, defmt::Format)]
@@ -38,6 +42,18 @@ where
         let mut buf = [0u8; 1];
         self.i2c.write_read(I2C_ADDR, &[reg], &mut buf).map_err(|_| Bmp580Error::I2c)?;
         Ok(buf[0])
+    }
+
+    /// Read-modify-write one bitfield within a register -- matches what
+    /// `adafruit_bmp5xx`'s `RWBits`/`RWBit` property descriptors actually
+    /// do on the wire (read current byte, clear just this field's bits,
+    /// OR in the new value, write back), not a precomputed "final byte"
+    /// for the whole register. See `rocket-logic::bmp580`'s docs on why
+    /// that distinction turned out to matter on real hardware.
+    fn set_bits(&mut self, reg: u8, mask: u8, shifted_value: u8) -> Result<(), Bmp580Error> {
+        let current = self.read_reg(reg)?;
+        let new_byte = (current & !mask) | (shifted_value & mask);
+        self.write_reg(reg, new_byte)
     }
 
     /// Reset and configure the sensor. Matches `adafruit_bmp5xx.BMP5XX.__init__`
@@ -71,18 +87,34 @@ where
         // -- __init__'s extra 2.5ms settle after reset() returns ------------
         Timer::after_micros(2500).await;
 
-        // -- config (device still in standby the whole time) ----------------
-        this.write_reg(REG_OSR_CONFIG, OSR_CONFIG_BYTE)?;
-        this.write_reg(REG_DSP_IIR, DSP_IIR_BYTE)?;
-        this.write_reg(REG_DSP_CONFIG, DSP_CONFIG_BYTE)?;
+        // -- config (device still in standby the whole time): genuine RMW
+        // per field, in the exact order adafruit_bmp5xx.BMP5XX.__init__
+        // calls the corresponding property setters. -----------------------
+        this.set_bits(REG_OSR_CONFIG, OSR_TEMP_MASK, OSR_TEMP_2X)?;
+        this.set_bits(REG_OSR_CONFIG, OSR_PRESS_MASK, OSR_PRESS_16X_SHIFTED)?;
+        this.set_bits(REG_ODR_CONFIG, ODR_RATE_MASK, ODR_RATE_50HZ_SHIFTED)?;
+        this.set_bits(REG_OSR_CONFIG, OSR_PRESS_ENABLED_MASK, OSR_PRESS_ENABLED_SHIFTED)?;
 
-        // -- ODR_CONFIG: three separate writes, not one -- see
-        // rocket-logic::bmp580's docs on why order matters here specifically.
-        this.write_reg(REG_ODR_CONFIG, ODR_CONFIG_STEP1_ODR_ONLY)?;
-        this.write_reg(REG_ODR_CONFIG, ODR_CONFIG_STEP2_DEEP_DISABLED)?;
-        this.write_reg(REG_ODR_CONFIG, ODR_CONFIG_STEP3_MODE_NORMAL)?;
+        this.set_bits(REG_DSP_IIR, IIR_TEMP_MASK, IIR_TEMP_COEFF_1)?;
+        this.set_bits(REG_DSP_IIR, IIR_PRESS_MASK, IIR_PRESS_COEFF_1_SHIFTED)?;
+        this.set_bits(REG_DSP_CONFIG, DSP_TEMP_SHADOW_MASK, DSP_TEMP_SHADOW_AFTER_SHIFTED)?;
+        this.set_bits(REG_DSP_CONFIG, DSP_PRESS_SHADOW_MASK, DSP_PRESS_SHADOW_AFTER_SHIFTED)?;
+        this.set_bits(REG_DSP_CONFIG, DSP_IIR_FLUSH_FORCED_MASK, DSP_IIR_FLUSH_FORCED_SHIFTED)?;
 
-        this.write_reg(REG_INT_SOURCE, INT_SOURCE_BYTE)?;
+        // -- mode = NORMAL: matches the `mode` setter's exact logic,
+        // including the conditional forced-standby step this driver
+        // previously assumed could never fire (it can -- see
+        // rocket-logic::bmp580's docs). -------------------------------
+        let odr_now = this.read_reg(REG_ODR_CONFIG)?;
+        if odr_now & ODR_MODE_MASK != ODR_MODE_STANDBY_SHIFTED {
+            this.set_bits(REG_ODR_CONFIG, ODR_DEEP_DISABLED_MASK, ODR_DEEP_DISABLED_SHIFTED)?;
+            this.set_bits(REG_ODR_CONFIG, ODR_MODE_MASK, ODR_MODE_STANDBY_SHIFTED)?;
+            Timer::after_micros(2500).await;
+        }
+        this.set_bits(REG_ODR_CONFIG, ODR_DEEP_DISABLED_MASK, ODR_DEEP_DISABLED_SHIFTED)?;
+        this.set_bits(REG_ODR_CONFIG, ODR_MODE_MASK, ODR_MODE_NORMAL_SHIFTED)?;
+
+        this.set_bits(REG_INT_SOURCE, INT_SRC_DATA_READY_EN_MASK, INT_SRC_DATA_READY_EN_SHIFTED)?;
 
         // -- _wait_first_data(timeout=0.03) ----------------------------------
         let deadline = Instant::now() + Duration::from_millis(30);

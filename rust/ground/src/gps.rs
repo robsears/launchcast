@@ -10,21 +10,26 @@
 //! match `rocket/code.py`'s (see `common::nmea`'s docs for why the
 //! accuracy gap that motivated this existed at all).
 //!
-//! Published fixes are a rolling [`FixAverage`] over
-//! [`FIX_AVERAGE_WINDOW_MS`], not the single latest sentence: this GPS's
-//! whole job is rangefinding a *stationary* handheld (see CLAUDE.md/the
-//! session that added the PMTK313/301/397 init above), and a raw
-//! instantaneous fix visibly wanders several meters sample-to-sample even
-//! at rest. Averaging several seconds' worth settles that out, at the
-//! cost of the displayed position lagging real motion by about that same
-//! window -- an explicit, acceptable trade for a rangefinder, not
-//! something a moving-vehicle tracker could get away with.
+//! Published fixes are a rolling [`FixAverage`] over the most recent
+//! `common::fix_average::WINDOW_SAMPLES` fixes, not the single latest
+//! sentence: this GPS's whole job is rangefinding a *stationary* handheld
+//! (see CLAUDE.md/the session that added the PMTK313/301/397 init
+//! above), and a raw instantaneous fix visibly wanders several meters
+//! sample-to-sample even at rest. Averaging settles that out, at the cost
+//! of the displayed position lagging real motion slightly -- an
+//! explicit, acceptable trade for a rangefinder, not something a
+//! moving-vehicle tracker could get away with. Published every loop
+//! tick, continuously, not on a periodic window -- see
+//! `common::fix_average`'s docs for why a fixed-capacity ring buffer
+//! replaced an earlier snapshot-and-reset-every-N-seconds design
+//! (2026-08-19, after real-hardware feedback that a full-flight distance
+//! reading took a few real minutes to settle after cold start).
 
 use embassy_rp::i2c::{Blocking, I2c};
 use embassy_rp::peripherals::I2C1;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::Timer;
 use heapless::String;
 use launchcast_ground_logic::{parse_rmc, FixAverage, NmeaLineReader};
 use launchcast_common::nmea::framed_command;
@@ -42,10 +47,6 @@ const POLL_PERIOD_MS: u64 = 200;
 /// Matches `code.py`'s "course over ground substitutes for a compass...
 /// only valid while moving" gate.
 const MIN_SPEED_FOR_HEADING_KNOTS: f32 = 1.0;
-/// How often to publish an averaged fix to [`MY_GPS`]. Every valid
-/// sentence received in between is folded into the running mean, not
-/// discarded -- see the module docs above.
-const FIX_AVERAGE_WINDOW_MS: u64 = 5000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MyFix {
@@ -102,8 +103,6 @@ pub async fn gps_task(mut i2c: I2c<'static, I2C1, Blocking>) {
     let mut reader: NmeaLineReader<96> = NmeaLineReader::new();
     let mut chunk = [0u8; CHUNK_SIZE];
     let mut avg = FixAverage::new();
-    let mut heading = None;
-    let mut window_deadline = Instant::now() + Duration::from_millis(FIX_AVERAGE_WINDOW_MS);
 
     loop {
         if i2c.blocking_read(GPS_I2C_ADDR, &mut chunk).is_ok() {
@@ -122,23 +121,18 @@ pub async fn gps_task(mut i2c: I2c<'static, I2C1, Blocking>) {
                 // quantity (allowed to average through a "wrap" like
                 // 359 deg/1 deg to something meaningless), and only
                 // valid while moving anyway, which is the one case this
-                // whole window-averaging scheme deliberately doesn't
-                // optimize for. Just track the most recent reading.
-                heading = if fix.speed_knots > MIN_SPEED_FOR_HEADING_KNOTS {
+                // whole averaging scheme deliberately doesn't optimize
+                // for. Just track the most recent reading.
+                let heading = if fix.speed_knots > MIN_SPEED_FOR_HEADING_KNOTS {
                     fix.track_deg
                 } else {
                     None
                 };
-            }
-        }
 
-        let now = Instant::now();
-        if now >= window_deadline {
-            if let Some((lat, lon)) = avg.mean() {
-                *MY_GPS.lock().await = Some(MyFix { lat, lon, heading });
+                if let Some((lat, lon)) = avg.mean() {
+                    *MY_GPS.lock().await = Some(MyFix { lat, lon, heading });
+                }
             }
-            avg.reset();
-            window_deadline = now + Duration::from_millis(FIX_AVERAGE_WINDOW_MS);
         }
 
         Timer::after_millis(POLL_PERIOD_MS).await;

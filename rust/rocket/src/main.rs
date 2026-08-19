@@ -33,6 +33,7 @@ mod radio;
 
 use core::cell::RefCell;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 
 use cortex_m_rt::entry;
 use defmt_rtt as _;
@@ -70,6 +71,15 @@ static mut CORE1_STACK: Stack<65536> = Stack::new();
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 static I2C_BUS: StaticCell<RefCell<I2c<'static, embassy_rp::peripherals::I2C1, embassy_rp::i2c::Blocking>>> = StaticCell::new();
+
+/// Reported in every telemetry frame's `fw_version` byte (a former
+/// reserved field, `cam_disk`, repurposed 2026-08-18 -- see
+/// docs/rust-rewrite.md) so a real deploy can be confirmed from
+/// telemetry alone, without needing to trust "I definitely just flashed
+/// it." Bump by hand on any flash meant to be distinguishable from the
+/// last one -- a plain counter, not a semver, since that's all this
+/// needs to answer "is this the build I think it is."
+const FIRMWARE_VERSION: u8 = 1;
 
 /// Matches `code.py`'s `CHIRP_MS`.
 const CHIRP_MS: u32 = 1000;
@@ -315,6 +325,10 @@ async fn flight_task(
                 log_writer.flush_if_any().await;
             }
         }
+        // Every tick, not just on change -- gps_task (same core1
+        // executor) reads this to decide whether to average incoming
+        // fixes or pass them through raw. See gps.rs's should_average.
+        gps::FLIGHT_STATE.store(fs.state, Ordering::Relaxed);
 
         // -- sense: GPS (paused during flight) -------------------------------
         if let Some(period) = gps_period_ms(fs.state) {
@@ -484,7 +498,7 @@ async fn core0_task(
                     // ground station's NOGO-while-charging gate won't
                     // actually trigger via telemetry yet.
                     sensors: t.sensors,
-                    cam_disk: 0,
+                    fw_version: FIRMWARE_VERSION,
                 };
                 counter = counter.wrapping_add(1);
                 if let Err(e) = radio.send_telemetry(&input).await {

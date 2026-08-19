@@ -13,6 +13,20 @@
 //! not a fresh (and unverifiable, without hardware) reading of the spec.
 //! The actual I2C transactions live in `rocket/src/bmp580.rs` (needs
 //! hardware); this module is everything that doesn't.
+//!
+//! **2026-08-19, real hardware**: the first version of this driver
+//! collapsed several of `adafruit_bmp5xx`'s individual RWBits/RWBit
+//! property-setter writes into one precomputed "final byte" write per
+//! register, reasoning that every bit not explicitly touched was already
+//! 0 after a soft reset. On real hardware that produced a frozen, wrong
+//! temperature reading (previously correct under CircuitPython, same
+//! physical sensor) -- strong evidence the chip never actually reached
+//! continuous measurement mode, i.e. that assumption was wrong somewhere.
+//! The config constants below are now `(mask, shifted_value)` pairs for a
+//! genuine read-modify-write per field, matching what the Python
+//! descriptors actually do on the wire, one call per field in the same
+//! order `__init__` makes them -- removing the assumption entirely
+//! rather than trying to guess which specific bit was the problem.
 
 /// Default Adafruit I2C address (confirmed against CLAUDE.md).
 pub const I2C_ADDR: u8 = 0x47;
@@ -44,54 +58,57 @@ pub const STATUS_NVM_ERR_BIT: u8 = 2;
 pub const INT_STATUS_DATA_READY_BIT: u8 = 0;
 pub const INT_STATUS_POR_BIT: u8 = 4;
 
-/// OSR_CONFIG (0x36): temperature_oversampling_rate=2x (bits[2:0]=0x01),
-/// pressure_oversampling_rate=16x (bits[5:3]=0x04), pressure_enabled=1
-/// (bit6) -- same values `adafruit_bmp5xx.BMP5XX.__init__` sets. A pure
-/// config register with no side effects while still in standby (the
-/// device doesn't start sampling until the mode write below), so unlike
-/// ODR_CONFIG the three RWBits/RWBit writes Python does individually
-/// collapse safely into one final-value write here.
-pub const OSR_CONFIG_BYTE: u8 = 0x61;
+// --- Config bitfields, as (mask, shifted_value) pairs for a genuine
+// read-modify-write per field -- one pair per `adafruit_bmp5xx`
+// RWBits/RWBit property setter `__init__` touches, in the *same order*.
+//
+// An earlier version of this driver collapsed several of these into one
+// precomputed "final byte" write per register, on the assumption that
+// every bit this driver doesn't explicitly set is already 0 after a
+// soft reset. On real hardware (2026-08-19) that assumption produced a
+// frozen, wrong temperature reading (previously correct under
+// CircuitPython on the same physical sensor) -- strong evidence the
+// chip wasn't actually reaching continuous measurement mode, i.e. that
+// assumption was wrong for at least one bit somewhere in this sequence.
+// Switched to genuine RMW, identical in shape to what the Python
+// property descriptors actually do on the wire, removing the assumption
+// entirely rather than trying to guess which specific bit was the
+// problem.
 
-/// DSP_IIR (0x31): temperature_iir_filter=COEFF_1 (bits[2:0]=0x01),
-/// pressure_iir_filter=COEFF_1 (bits[5:3]=0x01).
-pub const DSP_IIR_BYTE: u8 = 0x09;
+/// OSR_CONFIG (0x36) bitfields.
+pub const OSR_TEMP_MASK: u8 = 0b0000_0111; // bits[2:0]
+pub const OSR_TEMP_2X: u8 = 0x01;
+pub const OSR_PRESS_MASK: u8 = 0b0011_1000; // bits[5:3]
+pub const OSR_PRESS_16X_SHIFTED: u8 = 0x04 << 3;
+pub const OSR_PRESS_ENABLED_MASK: u8 = 0b0100_0000; // bit6
+pub const OSR_PRESS_ENABLED_SHIFTED: u8 = 1 << 6;
 
-/// DSP_CONFIG (0x30): pressure_shadow_iir=AFTER_IIR_FILTER (bit5),
-/// temperature_shadow_iir=AFTER_IIR_FILTER (bit3), iir_flush_forced=1
-/// (bit2). `*_fifo_iir` bits left at their post-reset default (0) --
-/// Python's `__init__` doesn't set them either.
-pub const DSP_CONFIG_BYTE: u8 = 0x2C;
+/// ODR_CONFIG (0x37) bitfields.
+pub const ODR_RATE_MASK: u8 = 0b0111_1100; // bits[6:2]
+pub const ODR_RATE_50HZ_SHIFTED: u8 = 0x0F << 2;
+pub const ODR_MODE_MASK: u8 = 0b0000_0011; // bits[1:0]
+pub const ODR_MODE_STANDBY_SHIFTED: u8 = 0x00;
+pub const ODR_MODE_NORMAL_SHIFTED: u8 = 0x01;
+pub const ODR_DEEP_DISABLED_MASK: u8 = 0b1000_0000; // bit7
+pub const ODR_DEEP_DISABLED_SHIFTED: u8 = 1 << 7;
 
-/// ODR_CONFIG (0x37) has to be written as three separate steps, not one
-/// final-value write like the config registers above -- this is the one
-/// register where `adafruit_bmp5xx`'s `mode` setter has real, deliberate
-/// sequencing (a Bosch-recommended pattern: set the output data rate
-/// while still in standby, *then* transition into normal/measuring mode
-/// as its own step) rather than converging to the same byte in any
-/// order. Ported as the same three writes, not collapsed, specifically
-/// to avoid introducing a divergence from known-working behavior that
-/// would be unverifiable without hardware.
-///
-/// Step 1: output_data_rate=ODR_50_HZ (bits[6:2]=0x0F), mode/deep_disabled
-/// left at their post-reset default (0/standby) -- matches Python setting
-/// `output_data_rate` before ever touching `mode`.
-pub const ODR_CONFIG_STEP1_ODR_ONLY: u8 = 0x3C;
-/// Step 2: `deep_disabled=1` added (bit7) -- the first half of Python's
-/// `mode` setter, unconditional. The setter's `if old_mode != STANDBY`
-/// branch (an extra forced-standby step with a 2.5ms settle) is not
-/// replicated here: this driver always calls this sequence immediately
-/// after a fresh reset, where the mode is already guaranteed STANDBY, so
-/// that branch is provably dead code in this driver's one call site --
-/// unlike the general-purpose Python library, which can't assume that.
-pub const ODR_CONFIG_STEP2_DEEP_DISABLED: u8 = 0xBC;
-/// Step 3: `mode=NORMAL` added (bits[1:0]=0x01) -- starts continuous
-/// measurement at the configured ODR/OSR.
-pub const ODR_CONFIG_STEP3_MODE_NORMAL: u8 = 0xBD;
+/// DSP_IIR (0x31) bitfields.
+pub const IIR_TEMP_MASK: u8 = 0b0000_0111; // bits[2:0]
+pub const IIR_TEMP_COEFF_1: u8 = 0x01;
+pub const IIR_PRESS_MASK: u8 = 0b0011_1000; // bits[5:3]
+pub const IIR_PRESS_COEFF_1_SHIFTED: u8 = 0x01 << 3;
 
-/// INT_SOURCE (0x15): data_ready_int_en=1 (bit0) only -- fifo/pressure-OOR
-/// interrupts explicitly left disabled, matching Python.
-pub const INT_SOURCE_BYTE: u8 = 0x01;
+/// DSP_CONFIG (0x30) bitfields.
+pub const DSP_TEMP_SHADOW_MASK: u8 = 0b0000_1000; // bit3
+pub const DSP_TEMP_SHADOW_AFTER_SHIFTED: u8 = 1 << 3;
+pub const DSP_PRESS_SHADOW_MASK: u8 = 0b0010_0000; // bit5
+pub const DSP_PRESS_SHADOW_AFTER_SHIFTED: u8 = 1 << 5;
+pub const DSP_IIR_FLUSH_FORCED_MASK: u8 = 0b0000_0100; // bit2
+pub const DSP_IIR_FLUSH_FORCED_SHIFTED: u8 = 1 << 2;
+
+/// INT_SOURCE (0x15) bitfields.
+pub const INT_SRC_DATA_READY_EN_MASK: u8 = 0b0000_0001; // bit0
+pub const INT_SRC_DATA_READY_EN_SHIFTED: u8 = 1;
 
 /// Sign-extend a 24-bit two's-complement value (as stored in the low 24
 /// bits of an i32) to a full i32.

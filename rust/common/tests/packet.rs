@@ -21,7 +21,7 @@ fn sample() -> TelemetryInput {
         satellites: 9,
         cam_rec: 0,
         sensors: Sensor::ALL,
-        cam_disk: 0,
+        fw_version: 7,
     }
 }
 
@@ -48,6 +48,7 @@ fn telemetry_round_trip() {
     assert_eq!(out.state_name(), "COAST");
     assert_eq!(out.alt_baro_m, 287);
     assert_eq!(out.satellites, 9);
+    assert_eq!(out.fw_version, 7);
     assert!(out.has_fix);
 }
 

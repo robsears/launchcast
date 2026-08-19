@@ -37,16 +37,18 @@ fn battery_percent_none_is_zero() {
 
 #[test]
 fn battery_percent_matches_the_formula_at_reference_points() {
-    // 123 * (1 - 1/((1 + (V/3.7)^80)^0.165)), hand-computed and verified
-    // in Python before implementing -- see docs/rust-rewrite.md.
+    // 153.75 * (1 - 1/((1 + (V/3.7)^80)^0.165)), hand-computed and
+    // verified in Python before implementing -- see
+    // docs/rust-rewrite.md's 2026-08-18 real-hardware entry for why the
+    // leading factor is 153.75 (=123/0.8), not 123.
     for (volts, expected_pct) in [
         (4.20, 100),
-        (4.10, 91),
-        (4.00, 79),
-        (3.90, 62),
-        (3.80, 38),
-        (3.70, 13),
-        (3.60, 2),
+        (4.10, 100),
+        (4.00, 99),
+        (3.90, 77),
+        (3.80, 48),
+        (3.70, 17),
+        (3.60, 3),
         (3.50, 0),
     ] {
         assert_eq!(battery_percent(Some(volts)), expected_pct, "at {volts}V");
@@ -89,11 +91,15 @@ fn battery_level_caps_at_4() {
 }
 
 #[test]
-fn battery_level_is_percent_over_25_capped() {
-    for volts in [4.20, 4.00, 3.90, 3.80, 3.68, 3.50, 3.30] {
-        assert_eq!(
-            battery_level(Some(volts)),
-            (battery_percent(Some(volts)) / 25).min(4)
-        );
-    }
+fn battery_level_boundary_voltages() {
+    // Cross-check against real battery_percent() output at voltages that
+    // land near each boundary (see battery_percent_matches_the_formula_at_reference_points).
+    assert_eq!(battery_percent(Some(4.00)), 99);
+    assert_eq!(battery_level(Some(4.00)), 4); // 99% -> above the 80 floor
+    assert_eq!(battery_percent(Some(3.90)), 77);
+    assert_eq!(battery_level(Some(3.90)), 3); // 77% -> above 60, at/under 80
+    assert_eq!(battery_percent(Some(3.80)), 48);
+    assert_eq!(battery_level(Some(3.80)), 2); // 48% -> above 40, at/under 60
+    assert_eq!(battery_percent(Some(3.70)), 17);
+    assert_eq!(battery_level(Some(3.70)), 0); // 17% -> at/under 20
 }

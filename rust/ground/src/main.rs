@@ -99,6 +99,13 @@ bind_interrupts!(struct Irqs {
 /// -- see `display.rs`).
 const DISPLAY_PERIOD_MS: u64 = 500;
 
+/// Shown on the FLIGHT screen's CONTROLLER panel, mirroring the rocket's
+/// own `FIRMWARE_VERSION` (`rocket/src/main.rs`) -- confirms a deploy to
+/// *this* board actually took, without needing to trust "I definitely
+/// just flashed it." Bump by hand on any flash meant to be
+/// distinguishable from the last one.
+pub const FIRMWARE_VERSION: u8 = 1;
+
 /// Dispatched (not raw) button events only -- taps/holds, not every GPIO
 /// edge -- so this channel only carries the handful of events a human
 /// actually produces, never a debounce-cadence stream.

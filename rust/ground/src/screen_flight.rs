@@ -39,12 +39,21 @@ pub const STATUS_Y: i32 = 204;
 const RX: i32 = 265;
 
 // The CONTROLLER column is shifted up from the ROCKET column's baseline
-// (44) to y=40 -- the highest screens are allowed to draw (see
-// screen_header.rs) -- freeing enough room below DIST for a 3-line
-// command log (see CMD_LOG_Y0 below) without moving STATUS_Y.
-const HANDHELD_Y: i32 = 40;
+// (44) -- unlike the general "screens don't draw above y=40" rule
+// (screen_header.rs), the header draws nothing at all in this column's
+// x-range (RX=265) above y=14: LAUNCHCAST/the screen name live at x=4,
+// the rocket cluster ends by ~x=222, and the handheld's own battery
+// cluster (x=315+) is well clear too -- so there's no header collision
+// to worry about here. Shifted to y=22 (2026-08-19, real-hardware
+// feedback -- was y=40, then y=40 again briefly with a version line
+// squeezed in below instead of here) specifically so the fw-version line
+// under "CONTROLLER" (MC_VERSION_Y) doesn't cost the command log any of
+// its vertical room -- net effect vs. the original (pre-version-line)
+// layout is everything below the glyph sits 8px *higher* now, not lower.
+const HANDHELD_Y: i32 = 22;
 const MC_TITLE_Y: i32 = HANDHELD_Y + handheld_art::HANDHELD_ART_H as i32 + 2;
-const MC_ROW0: i32 = MC_TITLE_Y + 18; // GPS LOCK
+const MC_VERSION_Y: i32 = MC_TITLE_Y + 18; // handheld fw version
+const MC_ROW0: i32 = MC_VERSION_Y + 10; // GPS LOCK
 const MC_ROW1: i32 = MC_ROW0 + 10; // BATTERY
 const MC_ROW2: i32 = MC_ROW1 + 10; // DIST
 const CMD_LOG_Y0: i32 = MC_ROW2 + 8;
@@ -79,9 +88,12 @@ where
 
     // ----- ROCKET systems check ------------------------------------------
     text(display, TABLE_X, 44, "ROCKET", 2);
-    text(display, TABLE_X, 64, "SYSTEMS CHECK:", 1);
 
     let mut line: String<40> = String::new();
+    let _ = core::fmt::write(&mut line, format_args!("SYSTEMS CHECK:   v{}", tel.fw_version));
+    text(display, TABLE_X, 64, &line, 1);
+
+    line.clear();
     let _ = core::fmt::write(&mut line, format_args!("ATMOSPHERE:      {}", online(tel.sensors, Sensor::BARO)));
     text(display, TABLE_X, 78, &line, 1);
 
@@ -176,6 +188,10 @@ where
 
     text(display, RX, MC_TITLE_Y, "CONTROLLER", 2);
 
+    let _ = core::fmt::write(&mut line, format_args!("FIRMWARE: v{}", crate::FIRMWARE_VERSION));
+    text(display, RX, MC_VERSION_Y, &line, 1);
+
+    line.clear();
     let _ = core::fmt::write(
         &mut line,
         format_args!("GPS LOCK: {}", if frame.my_lat.is_some() { "FIXED" } else { "SEARCH" }),

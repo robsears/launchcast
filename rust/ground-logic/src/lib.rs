@@ -6,7 +6,6 @@
 //! firmware crate) wires these to real hardware.
 #![cfg_attr(not(test), no_std)]
 
-pub mod fix_average;
 pub mod hold_tracker;
 pub mod icons;
 pub mod imu;
@@ -15,7 +14,6 @@ pub mod nav;
 pub mod nogo;
 pub mod units;
 
-pub use fix_average::FixAverage;
 pub use hold_tracker::{Edge, HoldTracker, KeyEvent, DEFAULT_GRACE_MS, DEFAULT_HOLD_MS};
 pub use nogo::{nogo_reason, NogoReason, NOGO_BATT_V};
 pub use icons::{battery_level, battery_percent, signal_level, signal_percent};
@@ -24,8 +22,9 @@ pub use link::{link_status, telemetry_missing, LinkStatus, LINK_LOST_MS, LINK_ST
 pub use nav::{bearing_deg, compass_point, haversine_m, relative_arrow, EARTH_R_M};
 pub use units::{c_to_f, m_to_ft, Units};
 
-// NMEA parsing moved to `launchcast_common::nmea` -- both boards' GPS
-// need it, not just the ground station's. Re-exported here under its old
-// path so `ground`'s existing `use launchcast_ground_logic::{checksum,
-// parse_rmc, NmeaLineReader}` keeps working unchanged.
+// NMEA parsing and GPS fix averaging moved to `launchcast_common` -- both
+// boards' GPS need them, not just the ground station's. Re-exported here
+// under their old paths so `ground`'s existing `use launchcast_ground_logic::
+// {checksum, parse_rmc, NmeaLineReader, FixAverage}` keeps working unchanged.
+pub use launchcast_common::fix_average::{self, FixAverage};
 pub use launchcast_common::nmea::{self, checksum, parse_rmc, NmeaLineReader, RmcFix};

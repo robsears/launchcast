@@ -49,7 +49,7 @@ PKT_COMMAND = 0x02      # Command packets; 0000 0010 in binary
 #  36      gps_flags    uint8    bit0 = fix, bits 1-5 = sat count
 #  37      cam_rec      uint8    reserved, send 0
 #  38      sensors      uint8    Sensor.* bitfield
-#  39      cam_disk     uint8    reserved, send 0
+#  39      fw_version   uint8    rocket firmware build counter (0 = unset)
 #                                                     total: 40 bytes
 
 TELEMETRY_FMT = "<BBHIBffhhhhhhhhhBBBBB"
@@ -71,7 +71,7 @@ def pack_telemetry(
     satellites,
     cam_rec=0,
     sensors=0,
-    cam_disk=0,
+    fw_version=0,
 ):
     """Build a 40-byte telemetry frame from physical units.
 
@@ -102,7 +102,7 @@ def pack_telemetry(
         encode_gps_flags(has_fix, satellites),
         cam_rec,
         sensors,
-        cam_disk,
+        fw_version,
     )
 
 
@@ -143,7 +143,7 @@ def unpack_telemetry(data):
         gps_flags,
         cam_rec,
         sensors,
-        cam_disk,
+        fw_version,
     ) = fields
 
     has_fix, satellites = decode_gps_flags(gps_flags)
@@ -165,7 +165,7 @@ def unpack_telemetry(data):
         "satellites": satellites,
         "cam_rec": bool(cam_rec),
         "sensors": sensors,
-        "cam_disk": cam_disk,
+        "fw_version": fw_version,
     }
 
 # COMMAND DATA:

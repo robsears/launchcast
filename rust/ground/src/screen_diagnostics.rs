@@ -49,7 +49,7 @@ where
     text(display, 4, 112, &line, 1);
 
     line.clear();
-    let _ = core::fmt::write(&mut line, format_args!("counter {}", tel.counter));
+    let _ = core::fmt::write(&mut line, format_args!("counter {}  fw v{}", tel.counter, tel.fw_version));
     text(display, 4, 132, &line, 1);
 
     let up: String<48> = join_names(Sensor::present(tel.sensors));

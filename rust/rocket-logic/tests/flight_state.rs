@@ -180,7 +180,7 @@ fn boost_fires_shortly_after_ignition() {
     let history = history_times(&run_default_profile(&mut fs, 120.0));
     // Must wait out BOOST_MIN_MS, but not much longer.
     let t = history[&State::BOOST];
-    assert!(BOOST_MIN_MS <= t && t <= BOOST_MIN_MS + 200);
+    assert!((BOOST_MIN_MS..=BOOST_MIN_MS + 200).contains(&t));
 }
 
 #[test]
@@ -289,13 +289,21 @@ fn boot_does_not_advance_on_acceleration() {
 
 // --- Thresholds are self-consistent ------------------------------------------
 
+// These compare compile-time constants, so clippy sees an always-true
+// assertion -- but they exist as *tests*, not `const { assert!(..) }`,
+// specifically so a future change to one of these thresholds that breaks
+// the invariant shows up as a `cargo test` failure, not a silent logic
+// bug. The lint's suggested const-block form wouldn't run as a test at
+// all.
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn coast_threshold_below_boost_threshold() {
     // Otherwise BOOST and COAST could both be true, or neither.
     assert!(COAST_THRESHOLD_G < BOOST_THRESHOLD_G);
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn boost_threshold_above_one_g() {
     // A rocket sitting on the pad reads 1 g. Anything at or below that
     // would fire BOOST the instant it is armed.
@@ -303,6 +311,7 @@ fn boost_threshold_above_one_g() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn coast_threshold_above_free_fall() {
     // Coast reads ~1 g from gravity, so the burnout threshold must sit
     // above it or COAST fires during the burn.
@@ -310,6 +319,7 @@ fn coast_threshold_above_free_fall() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn apogee_velocity_window_is_tight() {
     // Too wide and apogee fires during coast.
     assert!(0.0 < APOGEE_VEL_MPS && APOGEE_VEL_MPS <= 3.0);

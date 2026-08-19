@@ -12,6 +12,7 @@
 //! thumbv6m-none-eabi as well as the host.
 #![cfg_attr(not(test), no_std)]
 
+pub mod fix_average;
 pub mod nmea;
 
 // --- Protocol identity -------------------------------------------------------
@@ -51,7 +52,7 @@ pub const COMMAND_SIZE: usize = 7;
 //  36      gps_flags    u8       bit0 = fix, bits 1-5 = sat count
 //  37      cam_rec      u8       reserved, send 0
 //  38      sensors      u8       Sensor::* bitfield
-//  39      cam_disk     u8       reserved, send 0
+//  39      fw_version   u8       rocket firmware build counter (0 = unset)
 //                                                     total: 40 bytes
 
 /// Physical-unit inputs for [`pack_telemetry`]. Grouped into a struct rather
@@ -74,7 +75,13 @@ pub struct TelemetryInput {
     pub satellites: u8,
     pub cam_rec: u8,
     pub sensors: u8,
-    pub cam_disk: u8,
+    /// Rocket firmware build counter -- byte 39 of the wire format, a
+    /// former reserved field (`cam_disk`, always 0, never populated by
+    /// anything). Renamed and repurposed 2026-08-18 so real telemetry
+    /// can confirm a deploy actually took -- see docs/rust-rewrite.md.
+    /// `0` means "not set" (an older firmware, or ground station's own
+    /// telemetry which has no such field to report).
+    pub fw_version: u8,
 }
 
 /// A decoded telemetry frame, in physical units.
@@ -95,7 +102,7 @@ pub struct Telemetry {
     pub satellites: u8,
     pub cam_rec: bool,
     pub sensors: u8,
-    pub cam_disk: u8,
+    pub fw_version: u8,
 }
 
 impl Telemetry {
@@ -133,7 +140,7 @@ pub fn pack_telemetry(input: &TelemetryInput) -> [u8; TELEMETRY_SIZE] {
     buf[36] = encode_gps_flags(input.has_fix, input.satellites);
     buf[37] = input.cam_rec;
     buf[38] = input.sensors;
-    buf[39] = input.cam_disk;
+    buf[39] = input.fw_version;
 
     buf
 }
@@ -168,7 +175,7 @@ pub fn unpack_telemetry(data: &[u8]) -> Option<Telemetry> {
     let gps_flags = data[36];
     let cam_rec = data[37];
     let sensors = data[38];
-    let cam_disk = data[39];
+    let fw_version = data[39];
 
     let (has_fix, satellites) = decode_gps_flags(gps_flags);
 
@@ -188,7 +195,7 @@ pub fn unpack_telemetry(data: &[u8]) -> Option<Telemetry> {
         satellites,
         cam_rec: cam_rec != 0,
         sensors,
-        cam_disk,
+        fw_version,
     })
 }
 

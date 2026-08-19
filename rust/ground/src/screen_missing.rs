@@ -50,7 +50,9 @@ where
     missing_art::draw(display, ROCKET_X, ROCKET_Y, 1);
 
     text(display, TABLE_X, 44, "SEARCHING", 2);
-    text(display, TABLE_X, 64, "SYSTEMS CHECK:", 1);
+    // No telemetry means no rocket fw_version to show either -- "??"
+    // matches every other value on this screen (see ROWS below).
+    text(display, TABLE_X, 64, "SYSTEMS CHECK:   v??", 1);
 
     for (i, row) in ROWS.iter().enumerate() {
         text(display, TABLE_X, ROW0_Y + i as i32 * ROW_STEP, row, 1);

@@ -37,10 +37,13 @@ where
 
     // handheld's own battery -- separate from the rocket cluster above, or
     // it silently overwrites the one reading we have for the ground unit.
+    // No "HH" label (removed 2026-08-19) -- the ground glyph immediately
+    // to its left already identifies this as the handheld's own battery,
+    // same as the rocket icon does for the cluster above; the battery
+    // icon moved up into the row that label used to occupy.
     icons::draw_ground(display, 315, 4, 1);
-    text(display, 330, 4, "HH", 1);
-    icons::draw_battery(display, 330, 14, frame.my_batt, BinaryColor::On);
+    icons::draw_battery(display, 330, 4, frame.my_batt, BinaryColor::On);
     if frame.my_charging {
-        icons::draw_bolt(display, 330 + icons::BATT_W + 2, 14, 1);
+        icons::draw_bolt(display, 330 + icons::BATT_W + 2, 4, 1);
     }
 }

@@ -13,19 +13,32 @@
 //! for one diagnostic field wasn't judged worth the scope here. Can be
 //! added later if that field turns out to matter.
 //!
-//! Unlike the ground station's GPS, this publishes the *latest* fix
-//! directly, not a rolling average -- `rocket/code.py` doesn't average
-//! either (`lat = hw.gps.latitude or 0.0`, straight off the just-parsed
-//! sentence), and this GPS's job (position during/after an actual flight)
-//! isn't the ground station's "settle a stationary reading" problem the
-//! averaging exists for.
+//! Unlike `rocket/code.py` (`lat = hw.gps.latitude or 0.0`, straight off
+//! the just-parsed sentence, always), this averages fixes the same way
+//! the ground station does ([`FixAverage`], `common::fix_average`'s
+//! fixed-capacity ring buffer, published continuously as new samples
+//! arrive) -- but only while the rocket is stationary and something
+//! might actually read the result: BOOT/IDLE waiting on the pad, and
+//! LANDED during recovery. The instant flight is detected (ARMED through
+//! DESCENT -- see [`should_average`]) this publishes the latest raw
+//! sample directly instead, both because averaging a moving GPS just
+//! adds lag to a position nothing reads until recovery anyway
+//! (`gps_period_ms` in `main.rs` already pauses GPS *polling* entirely
+//! for those states) and because letting the ring buffer keep filling
+//! through a flight would delay how quickly the first post-landing
+//! average sheds stale airborne samples -- [`should_average`]'s
+//! transition edge resets it instead of waiting that out.
+
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use embedded_hal::i2c::I2c;
 use heapless::String;
+use launchcast_common::fix_average::FixAverage;
 use launchcast_common::nmea::{framed_command, parse_rmc, NmeaLineReader};
+use launchcast_common::State;
 
 /// Confirmed via CLAUDE.md -- the PA1010D's fixed I2C address. Generic
 /// over `I2c` (not the concrete `embassy_rp::i2c::I2c`) -- this GPS
@@ -40,6 +53,27 @@ const CHUNK_SIZE: usize = 32;
 /// this GPS doesn't need the ground station's faster-sampling-for-
 /// averaging treatment, so polls at a plain, unhurried cadence.
 const POLL_PERIOD_MS: u64 = 200;
+
+/// Current flight phase, published by `flight_task` (`main.rs`) every
+/// loop tick so this task can decide whether to average incoming fixes
+/// or pass them through raw -- see module docs and [`should_average`].
+/// `Relaxed`: `gps_task` and `flight_task` both run on the same
+/// cooperative, single-threaded core1 executor, so there's no real
+/// concurrent-write race here, just a "read the latest published value"
+/// need.
+pub static FLIGHT_STATE: AtomicU8 = AtomicU8::new(State::BOOT);
+
+/// Average incoming fixes while the rocket is stationary and something
+/// will eventually read the result (BOOT/IDLE on the pad, LANDED during
+/// recovery); publish raw the instant it's plausibly moving (ARMED --
+/// the countdown to boost -- through DESCENT). See module docs for why
+/// ARMED is grouped with "stationary" here even though the rocket could
+/// in principle be handled at that moment: it's still sitting on the pad
+/// pre-launch, no different from IDLE, and `gps_period_ms` doesn't even
+/// poll GPS again until BOOST clears anyway.
+fn should_average(state: u8) -> bool {
+    !matches!(state, State::BOOST | State::COAST | State::APOGEE | State::DESCENT)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpsFix {
@@ -81,8 +115,22 @@ pub async fn gps_task(mut i2c: crate::i2c_bus::SharedI2cDevice) {
 
     let mut reader: NmeaLineReader<96> = NmeaLineReader::new();
     let mut chunk = [0u8; CHUNK_SIZE];
+    let mut avg = FixAverage::new();
+    let mut averaging = should_average(FLIGHT_STATE.load(Ordering::Relaxed));
 
     loop {
+        // -- flight-phase edge: start the next average clean rather than
+        // carrying over samples from whichever period (airborne or
+        // stationary) just ended -- see module docs. The ring buffer
+        // would eventually evict a stale run on its own (see
+        // common::fix_average's docs), but not until WINDOW_SAMPLES more
+        // samples arrive -- an explicit reset here is instant instead. --
+        let now_averaging = should_average(FLIGHT_STATE.load(Ordering::Relaxed));
+        if now_averaging != averaging {
+            avg.reset();
+            averaging = now_averaging;
+        }
+
         if i2c.read(GPS_I2C_ADDR, &mut chunk).is_ok() {
             for &byte in &chunk {
                 let Some(line) = reader.feed(byte) else {
@@ -91,16 +139,28 @@ pub async fn gps_task(mut i2c: crate::i2c_bus::SharedI2cDevice) {
                 let Some(fix) = parse_rmc(&line) else {
                     continue;
                 };
+                // has_fix flips immediately either way -- matches this
+                // module's original (and still deliberate) behavior of
+                // not latching a stale fix through a lost signal, unlike
+                // the ground station. Only lat/lon go through the
+                // average.
                 let mut g = GPS_FIX.lock().await;
+                g.has_fix = fix.valid;
                 if fix.valid {
-                    g.has_fix = true;
-                    g.lat = fix.lat;
-                    g.lon = fix.lon;
-                } else {
-                    g.has_fix = false;
+                    if averaging {
+                        avg.add(fix.lat, fix.lon);
+                        if let Some((lat, lon)) = avg.mean() {
+                            g.lat = lat;
+                            g.lon = lon;
+                        }
+                    } else {
+                        g.lat = fix.lat;
+                        g.lon = fix.lon;
+                    }
                 }
             }
         }
+
         Timer::after_millis(POLL_PERIOD_MS).await;
     }
 }

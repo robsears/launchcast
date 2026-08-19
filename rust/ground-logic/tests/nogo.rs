@@ -18,7 +18,7 @@ fn telemetry(batt_volts: f32, sensors: u8) -> Telemetry {
         satellites: 0,
         cam_rec: false,
         sensors,
-        cam_disk: 0,
+        fw_version: 0,
     }
 }
 

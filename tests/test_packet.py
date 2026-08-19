@@ -339,5 +339,5 @@ def test_sync_word_avoids_lora_defaults():
 
 def test_telemetry_fmt_matches_documented_field_count():
     # 21 fields: magic, type, counter, uptime, state, lat, lon, alt, speed,
-    # temp, 3 accel, 3 gyro, batt, gps_flags, cam_rec, sensors, cam_disk
+    # temp, 3 accel, 3 gyro, batt, gps_flags, cam_rec, sensors, fw_version
     assert len(struct.unpack(packet.TELEMETRY_FMT, b"\x00" * 40)) == 21
