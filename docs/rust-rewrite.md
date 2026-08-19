@@ -1027,13 +1027,14 @@ after landing to fully evict the pre-flight data mixed in.
   consistency with its other placeholder fields.
 - Handheld's own firmware version (new `ground::FIRMWARE_VERSION`
   constant, mirroring the rocket's) now shown on its own line under the
-  "CONTROLLER" title. The handheld's art glyph is already drawn at
+  "CONTROLLER" title. ~~The handheld's art glyph is already drawn at
   `y=40`, the topmost a screen is allowed to draw (see
   `screen_header.rs`), so it couldn't move up any further to make room --
   the version line was inserted right under the title instead, pushing
-  GPS LOCK/BATTERY/DIST/the 3-line command log down 10px each. Checked
-  there was enough slack before `FOOTER_Y` (222) for that: there was,
-  with margin to spare.
+  GPS LOCK/BATTERY/DIST/the 3-line command log down 10px each.~~ --
+  superseded next real-hardware round, see below: the glyph *did* end up
+  moving, once it turned out the header draws nothing at all in that
+  column.
 - Header's "HH" label (next to the handheld's own battery icon) removed;
   the battery icon moved up into the row the label used to occupy. The
   ground glyph immediately to its left already identifies whose battery
@@ -1042,6 +1043,171 @@ after landing to fully evict the pre-flight data mixed in.
   (0-24/25-49/50-74/75-99/100 -> 0-4 bars) to user-specified thresholds
   aligned to round 20% boundaries: >80% is 4 bars, >60% is 3, >40% is 2,
   >20% is 1, 20% or under is 0 (each floor exclusive).
+
+### 2026-08-19 -- FLIGHT screen fixes after real-hardware feedback; flight-log retrieval tool
+
+**FLIGHT screen, second pass.** Three bugs/asks from the first real
+reflash of the above:
+- **Duplicate/garbled "SYSTEMS CHECK" line** -- not actually a duplicate
+  draw call, a missing `line.clear()`: the ATMOSPHERE row's
+  `core::fmt::write` appended onto the still-populated "SYSTEMS
+  CHECK:   v{n}" string instead of starting fresh, so row two rendered
+  as "SYSTEMS CHECK:   v1ATMOSPHERE:      ONLINE" with no line break,
+  while row one correctly showed the same "SYSTEMS CHECK:   v1" text --
+  reading, from the user's side, as the line appearing twice. Fixed with
+  the missing `.clear()`, matching every other row in that function.
+- CONTROLLER's version line changed from bare "v1" to "FIRMWARE: v1".
+- **The handheld's art glyph moved up (`HANDHELD_Y`: 40 -> 22)**,
+  superseding the previous entry's assumption that y=40 was a hard
+  floor. That assumption came from the *general* "screens don't draw
+  above y=40" rule (screen_header.rs) -- true in general, but the
+  CONTROLLER column's x-range (RX=265) turns out to be dead space in the
+  header specifically: LAUNCHCAST/the screen name live at x=4, the
+  rocket cluster ends by ~x=222, and the handheld's own battery cluster
+  starts at x=315+, so nothing in the header actually occupies x=265 at
+  any y above 14. Moving the glyph up 18px there costs nothing. Net
+  effect vs. the very first (pre-version-line) layout: GPS LOCK/BATTERY/
+  DIST/the command log all sit 8px *higher* than they originally did,
+  not lower -- more room for the command log, not less, satisfying the
+  user's explicit ask not to lose any of it.
+
+**Flight-log retrieval tool, from scratch.** The biggest concrete gap
+flagged at the end of the previous session: the Rust rewrite moved
+flight logging off a FAT `flight.bin` file onto a raw flash partition
+specifically to dodge the FAT-corruption problem CircuitPython kept
+hitting (`docs/filesystem-recovery.md`) -- but that also meant `make
+pull-log` (a plain `cp` off a mounted CIRCUITPY-style volume) can't work
+against it at all, and nothing else existed to take its place. Fixed:
+- `LOG_PARTITION_OFFSET`/`LOG_PARTITION_SIZE`/`FLASH_SIZE` moved from
+  `rocket/src/flash_log.rs` to `rocket-logic/src/flash_log.rs` -- pure
+  constants, no hardware dependency despite living in the
+  hardware-touching module, moved so a host-side tool can import the one
+  real source of truth instead of hand-copying the numbers (the exact
+  kind of drift this whole port has tried to avoid by working from real
+  sources rather than re-derived assumptions).
+- New crate `rust/log-decode` (`launchcast-log-decode`, workspace member,
+  in `default-members` since it's host-only): a plain std CLI,
+  `log-decode <dump.bin> [output-dir]`, that walks a raw partition dump
+  and decodes it into one CSV per flight session found. Reuses
+  `rocket-logic::flash_log::decode_record` rather than reimplementing
+  the record format, so it can't silently drift from what the firmware
+  actually writes. Sessions are split on a decode failure (a blank/
+  corrupt record) and the next search always resumes at the next sector
+  boundary -- not `align_up_to_sector` (that leaves an already-aligned
+  offset unchanged, which would spin forever if a session happened to
+  end exactly on one) -- matching how the firmware only ever starts a
+  new arm cycle at a sector boundary, so a dump holding several
+  never-erased past flights decodes into several separate CSVs, not one
+  contaminated blob. 4 integration tests run the compiled binary itself
+  against synthetic dumps (single session, two sessions split by a
+  sector gap, a corrupted trailing record, an all-erased empty dump) --
+  chose to test the real CLI surface, not an internal function, since
+  that's the actual interface this tool promises to get right.
+- Retrieval itself goes through `picotool` (added to the nix devshell)
+  in ROM bootloader mode -- the *same* double-tap-RESET state already
+  used to flash a new `.uf2`, so no new hardware workflow to learn --
+  reading the memory-mapped address range `0x10100000..0x10800000`
+  (`LOG_PARTITION_OFFSET`/`FLASH_SIZE` offset by the RP2040's
+  `0x10000000` XIP base; picotool addresses are memory-mapped, not
+  flash-relative). Wired up as `make pull-log-rust`: saves the raw dump
+  to `flights/<timestamp>-rust.bin` (same `flights/` convention as the
+  existing CircuitPython-era `pull-log`), then immediately runs
+  `log-decode` on it. Confirmed against synthetic data (build/clippy/
+  test clean, plus a manual smoke test with a hand-built two-session
+  dump) -- **not yet run against a real board's actual partition**, since
+  no real flight has happened yet to populate one.
+- `make clean-log-rust`: bulk-erase the whole partition via `picotool
+  erase -r`, same address range as retrieval, same explicit
+  type-"yes"-to-continue confirmation as the CircuitPython-era
+  `clean-log`. Exists because a `DISARM`-without-boost deliberately
+  *can't* do this -- by design it only ever erases its own aborted
+  cycle's own bytes (see the Q&A that prompted this: walked through why
+  an aborted arm/disarm sandwiched between two real flights doesn't
+  touch either of them, since `arm_cycle_start` is always captured after
+  all prior data) -- so mass-clearing everything needs a genuinely
+  separate, deliberately separate-and-confirmed operation. Runs entirely
+  offline against the flash chip in BOOTSEL mode -- the firmware isn't
+  running, so nothing needs to coordinate with it; `LogArchive`'s
+  boot-time resume scan just finds an empty partition next time and
+  starts over from `LOG_PARTITION_OFFSET`, same as a never-armed board.
+
+Full field runbook for all of the above (BOOTSEL entry, pulling, what the
+output means, bulk erase, troubleshooting): `docs/flight-log-retrieval.md`.
+
+### 2026-08-19 -- RECOVER command; rocket cold-boot fix; real double-tap-RESET support; log-decode session-splitting bug found on the first real pull
+
+**No way out of LANDED.** Simulating a flight through to `LANDED` revealed
+the recovery beacon (three-pulse DOT-DOT-DOT, repeating) had no way to
+silence it in software -- `ARM` only accepts from `IDLE`, `DISARM` only
+from `ARMED`, so nothing in the uplink protocol could touch `LANDED` at
+all. Fixed by reusing the *same* `Command::DISARM` wire byte (no protocol
+change) for a new "RECOVER" meaning when sent from `LANDED`: silences the
+beacon, returns to `IDLE`, but -- unlike a real DISARM-from-ARMED --
+deliberately does **not** send `ArmCycleEvent::RewindWithoutBoost`, since
+this flight's data is real and already flushed (rewinding would erase it,
+the opposite of the point). `screen_footer.rs` shows "HOLD:RECOVER"
+instead of blank/"HOLD:ARM" when the rocket's last-known state is
+`LANDED`, not gated on NOGO at all (silencing a beacon isn't a
+launch-safety decision). `cmdlog.rs` threads a cosmetic `recover: bool`
+through so the command log prints "SENT RECOVER.../RECOVERED OK" instead
+of the DISARM wording for this case, even though it's the same command on
+the wire.
+
+**Rocket cold-boot-on-battery fix**, mirrored exactly from the ground
+station's earlier fix (same signature: RESET fixes it, fresh power-on
+alone doesn't) -- same 100ms `cortex_m::asm::delay` right after
+`embassy_rp::init()`, before anything else touches a peripheral.
+
+**Double-tap RESET, implemented for real.** User report: it stopped
+working (or maybe never really worked) on the rocket specifically. Checked
+`embassy-rp` and `rp2040-boot2`'s actual source, not assumed: neither
+implements double-tap-to-BOOTSEL detection at all -- nothing resembling a
+scratch-register check anywhere in either crate. On Adafruit's boards this
+is normally provided by whatever application is currently flashed
+(CircuitPython did it before this board ran Rust); RP2040 has no
+protected, separately-flashed bootloader region the way SAMD boards do, so
+a `no_std`/`no_main` image that fully replaces CircuitPython via UF2 also
+replaces whatever was providing it. Conclusion: this most likely never
+actually worked from our own firmware, full stop -- not something that
+regressed. Implemented properly in `rocket/src/main.rs`
+(`enter_bootsel_on_double_tap`): the same watchdog-scratch-register
+technique those other bootloaders use (survives a RESET-pin reset, cleared
+by real power-on), a ~500ms window, `embassy_rp::rom_data::
+reset_to_usb_boot(0, 0)` to actually jump. Called *after* the cold-boot
+settle delay above, not before -- it touches a real peripheral
+(`WATCHDOG`), which is exactly the class of thing that delay exists to
+protect. Getting *this* fix onto the board for the first time required the
+physical BOOT button instead (double-tap can't bootstrap itself onto a
+board that doesn't have the code yet) -- confirmed working via that path.
+Real-hardware confirmation that double-tap itself now works is still
+pending -- the user reported it still not landing reliably even after this
+fix; suspected timing mismatch (a ~600ms total window from power-on to
+disarm, if the two presses land further apart than that they'd miss) but
+not yet root-caused further. Only applied to the rocket so far (that's
+what was reported broken) -- the ground station likely has the identical
+latent gap, flagged, not yet fixed there.
+
+**First real log pull -- found and fixed a real decoder bug.** Once
+`picotool`'s USB permissions were sorted out (NixOS needs `services.udev.
+packages = [ pkgs.picotool ];` installed -- the package ships the correct
+`uaccess`-tagged rules already, they're just not wired into the system by
+default), the very first real pull off this board (which had accumulated
+hours of bench-testing arm cycles across many firmware builds, never once
+erased) surfaced a genuine bug: one decoded "session" showed `-12.5 hPa`
+pressure and wildly inconsistent temperatures, with `t_ms` jumping
+`64623 -> 11024` partway through. Root cause: `find_sessions` only split on
+a decode failure, but a new arm cycle can start immediately after the
+previous one's data with **zero gap** (`ArmCycleEvent::Start` only
+guarantees a sector-aligned start, not a blank one) -- so two unrelated arm
+cycles from different power cycles got spliced into one apparent session.
+Fixed by also splitting whenever `t_ms` decreases between two otherwise-
+valid consecutive records -- `t_ms` is uptime-since-boot, so it can only
+go backward at a real boot boundary. New regression test
+(`two_arm_cycles_with_no_gap_between_them_still_split_on_the_time_reset`)
+locks this in. Re-ran the fix against the actual pulled dump: the bogus
+5-record session correctly split into two clean, monotonic 3- and
+2-record sessions. Full runbook for the whole retrieval process, including
+this finding: `docs/flight-log-retrieval.md`.
 
 ## Why
 

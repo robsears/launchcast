@@ -37,7 +37,7 @@ in
   libs-ground =
     mk "libs-ground" "libs-ground" [ ]
       "Install CircuitPython libraries on the ground board via circup";
-  pull-log = mk "pull-log" "pull-log" [ ] "Retrieve flight.bin from the rocket board into flights/";
+  pull-log = mk "pull-log" "pull-log-rust" [ ] "Retrieve flight.bin from the rocket board into flights/";
   monitor = mk "monitor" "monitor" [ pkgs.minicom ] "Open a serial console to the board";
   default = mk "default" "check" [ ] "Run tests then lint (alias for check)";
 }

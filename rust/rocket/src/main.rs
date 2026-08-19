@@ -48,7 +48,9 @@ use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
+use embassy_rp::rom_data;
 use embassy_rp::spi::{Config as SpiConfig, Spi};
+use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_hal_bus::i2c::RefCellDevice;
 use launchcast_common::{self as common, Command, Sensor, State};
@@ -125,9 +127,74 @@ fn gps_period_ms(state: u8) -> Option<u32> {
     }
 }
 
+/// Watchdog scratch register used to detect a double-tap RESET. Arbitrary
+/// index -- this firmware owns the whole boot chain (see
+/// [`enter_bootsel_on_double_tap`]'s docs), so there's no other consumer
+/// to collide with.
+const DOUBLE_TAP_SCRATCH: usize = 0;
+/// Arbitrary, never written by anything but this function.
+const DOUBLE_TAP_MAGIC: u32 = 0x5A5A_A5A5;
+/// How long a second RESET has to land in to count as a "double tap" --
+/// matches the rough few-hundred-ms window other RP2040 boards' factory
+/// bootloaders use: short enough not to catch an unrelated later reset,
+/// long enough to actually hit with two real button presses.
+const DOUBLE_TAP_WINDOW_CYCLES: u32 = 62_500_000; // ~500ms at 125MHz
+
+/// Jump straight into the ROM USB bootloader (BOOTSEL / `RPI-RP2`) if
+/// this boot is the second of two RESET presses within
+/// [`DOUBLE_TAP_WINDOW_CYCLES`] of each other; otherwise arms the window
+/// and returns normally after it elapses.
+///
+/// **Why this exists**: "double-tap RESET to flash a new .uf2" is not an
+/// RP2040 silicon feature, and neither `embassy-rp` nor `rp2040-boot2`
+/// implement it (checked directly against both crates' source, not
+/// assumed -- neither has anything resembling a double-reset/scratch-
+/// register check anywhere). On Adafruit's boards it's normally provided
+/// by whatever application is currently flashed -- CircuitPython did
+/// this before this board ever ran Rust firmware. A `no_std`/`no_main`
+/// image that fully replaces CircuitPython (as this one does, via UF2 --
+/// there's no protected, separately-flashed bootloader region on RP2040
+/// the way SAMD boards have) also replaces whatever was implementing
+/// this, so nothing provides it anymore unless the firmware does it
+/// itself. This is that implementation, using the same watchdog-scratch-
+/// register technique those other bootloaders use: scratch registers
+/// live in the always-on power domain, so they survive a RESET-pin
+/// reset but are cleared by a genuine power-on, which is exactly the
+/// "was I *just* reset a moment ago" signal this needs.
+///
+/// Called from `main()` *after* the cold-boot settle delay, not before:
+/// this touches a real peripheral (`WATCHDOG`), and the whole reason
+/// that delay exists is that touching a peripheral before the power rail
+/// has settled is exactly what was failing on battery-only cold boots.
+fn enter_bootsel_on_double_tap(watchdog_peri: embassy_rp::Peri<'static, embassy_rp::peripherals::WATCHDOG>) {
+    let mut watchdog = Watchdog::new(watchdog_peri);
+
+    let armed = watchdog.get_scratch(DOUBLE_TAP_SCRATCH) == DOUBLE_TAP_MAGIC;
+    // Clear immediately either way -- a stale magic must never linger
+    // into some later, unrelated boot and misfire as a "double tap".
+    watchdog.set_scratch(DOUBLE_TAP_SCRATCH, 0);
+    if armed {
+        rom_data::reset_to_usb_boot(0, 0); // does not return
+    }
+
+    watchdog.set_scratch(DOUBLE_TAP_SCRATCH, DOUBLE_TAP_MAGIC);
+    cortex_m::asm::delay(DOUBLE_TAP_WINDOW_CYCLES);
+    watchdog.set_scratch(DOUBLE_TAP_SCRATCH, 0);
+}
+
 #[entry]
 fn main() -> ! {
     let p = embassy_rp::init(Config::default());
+
+    // Cold-boot-on-battery-only fix, mirrored from ground/src/main.rs
+    // (same signature there: a RESET press fixes it, fresh power-on
+    // alone doesn't -- see that file's docs for the full power-rail-
+    // settling-race diagnosis). Must run before enter_bootsel_on_double_tap
+    // below, and before either core touches any other peripheral.
+    cortex_m::asm::delay(12_500_000); // ~100ms at the 125MHz clock init() just configured
+
+    enter_bootsel_on_double_tap(p.WATCHDOG);
+
     defmt::info!("launchcast-rocket: boot ok, spawning core1 (sensors + flight state)");
 
     spawn_core1(
@@ -370,6 +437,20 @@ async fn flight_task(
                 // 2026-08-18, see docs/rust-rewrite.md.
                 flash_log::ARM_CYCLE_EVENTS.send(flash_log::ArmCycleEvent::RewindWithoutBoost).await;
                 defmt::info!("DISARMED (log rewound)");
+            } else if cmd == Command::DISARM && fs.state == State::LANDED {
+                // "RECOVER" on the ground station's footer -- same wire
+                // command as DISARM (no protocol change needed), but from
+                // LANDED this just silences the recovery beacon and
+                // returns to IDLE for the next flight. Deliberately does
+                // NOT send RewindWithoutBoost: unlike an aborted pre-boost
+                // arm, this flight is real and its data is already
+                // flushed (see the LANDED-transition flush above) -- user
+                // call, 2026-08-19, after finding out the hard way there
+                // was previously no way out of LANDED at all short of a
+                // power cycle.
+                fs.transition(State::IDLE, now_ms);
+                pixel.set_state(State::IDLE).await;
+                defmt::info!("RECOVERED -- beacon silenced, back to IDLE");
             } else if cmd == Command::CHIRP {
                 chirp_until = now_ms.wrapping_add(CHIRP_MS);
             }

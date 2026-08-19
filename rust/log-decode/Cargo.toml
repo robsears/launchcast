@@ -1,0 +1,19 @@
+[package]
+name = "launchcast-log-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Decode a raw dump of the rocket's flight-log flash partition into CSV"
+license = "Apache-2.0"
+
+[[bin]]
+name = "log-decode"
+path = "src/main.rs"
+
+# std, unlike every other crate in this workspace -- this runs on a
+# developer's machine against a file `picotool` already pulled off the
+# board, never on the RP2040 itself. Depends on launchcast-rocket-logic
+# (no_std, but perfectly usable from a std binary) for the record
+# format/decode function and the partition-layout constants, so this
+# tool can't silently drift from what the firmware actually writes.
+[dependencies]
+launchcast-rocket-logic = { path = "../rocket-logic" }

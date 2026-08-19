@@ -29,6 +29,12 @@ pub const STATUS_LEN: usize = 32;
 struct Pending {
     want: u8,
     packets_at_send: u32,
+    /// Cosmetic only -- both a genuine DISARM (from ARMED) and a RECOVER
+    /// (from LANDED, see `main.rs`'s hold dispatch) send the identical
+    /// `Command::DISARM` wire byte and resolve on the identical
+    /// `want == IDLE` condition; this just picks which label `poll`
+    /// prints on success.
+    recover: bool,
 }
 
 pub struct CmdLogState {
@@ -78,7 +84,11 @@ pub async fn snapshot() -> CmdLogSnapshot {
 /// [`poll`] resolves later. `packets_at_send` should be
 /// `radio::PACKET_COUNT`'s value at send time -- matches `code.py`'s
 /// `link.packets` snapshot in the same spot.
-pub async fn record_send(cmd: u8, packets_at_send: u32) {
+/// `recover` distinguishes a RECOVER (silences the LANDED beacon) from a
+/// genuine DISARM (aborts an armed-but-not-yet-boosted cycle) -- both
+/// send the same `Command::DISARM` byte, see [`Pending::recover`]'s
+/// docs. Ignored for ARM/CHIRP.
+pub async fn record_send(cmd: u8, packets_at_send: u32, recover: bool) {
     let mut log = CMD_LOG.lock().await;
     if cmd == common::Command::CHIRP {
         log.push_status("SENT CHIRP");
@@ -86,14 +96,16 @@ pub async fn record_send(cmd: u8, packets_at_send: u32) {
         log.pending = Some(Pending {
             want: common::State::ARMED,
             packets_at_send,
+            recover: false,
         });
         log.push_status("SENT ARM...");
     } else if cmd == common::Command::DISARM {
         log.pending = Some(Pending {
             want: common::State::IDLE,
             packets_at_send,
+            recover,
         });
-        log.push_status("SENT DISARM...");
+        log.push_status(if recover { "SENT RECOVER..." } else { "SENT DISARM..." });
     }
 }
 
@@ -112,6 +124,8 @@ pub async fn poll(current_state: Option<u8>, packets_now: u32, status: LinkStatu
         log.pending = None;
         log.push_status(if pending.want == common::State::ARMED {
             "ARMED OK"
+        } else if pending.recover {
+            "RECOVERED OK"
         } else {
             "DISARMED OK"
         });

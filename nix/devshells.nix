@@ -21,6 +21,7 @@ in
       pkgs.minicom # serial terminal to the Feather REPL
       pkgs.openscad # parametric CAD for the payload sled
       pkgs.elf2uf2-rs # converts RP2040 firmware ELF -> .uf2 for BOOTSEL flashing
+      pkgs.picotool # talks to an RP2040 in BOOTSEL mode; used to pull the raw flight-log partition (see Makefile's pull-log-rust)
     ]);
   };
 }

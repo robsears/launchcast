@@ -43,6 +43,10 @@ impl<'a> Frame<'a> {
         self.tel.is_some_and(|t| t.state == common::State::ARMED)
     }
 
+    pub fn landed(&self) -> bool {
+        self.tel.is_some_and(|t| t.state == common::State::LANDED)
+    }
+
     pub fn payload_batt(&self) -> Option<f32> {
         self.tel.map(|t| t.batt_volts)
     }

@@ -1067,6 +1067,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "launchcast-log-decode"
+version = "0.1.0"
+dependencies = [
+ "launchcast-rocket-logic",
+]
+
+[[package]]
 name = "launchcast-rocket"
 version = "0.1.0"
 dependencies = [

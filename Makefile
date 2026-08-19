@@ -15,7 +15,9 @@
 #   make deploy-rocket     copy payload firmware to the rocket board
 #   make deploy-ground     copy handheld firmware to the ground station
 #   make libs-rocket       install CircuitPython libraries on the rocket board
-#   make pull-log          retrieve flight.bin from the rocket board
+#   make pull-log          retrieve flight.bin from the rocket board (CircuitPython)
+#   make pull-log-rust     retrieve + decode the flight log (Rust firmware)
+#   make clean-log-rust    bulk-erase every flight in the log partition (Rust firmware)
 #   make monitor           open a serial console
 
 # Portable across NixOS, macOS, and CI:
@@ -56,7 +58,7 @@ GROUND_LIBS := adafruit_rfm9x adafruit_gps adafruit_sharpmemorydisplay \
                adafruit_framebuf
 
 .PHONY: help test lint check fmt deploy-rocket deploy-ground \
-        libs-rocket libs-ground pull-log clean-log monitor volumes doctor \
+        libs-rocket libs-ground pull-log pull-log-rust clean-log clean-log-rust monitor volumes doctor \
 		setup-rocket setup-ground
 
 help:
@@ -160,6 +162,56 @@ pull-log:
 	@stamp=$$(date +%Y%m%d-%H%M%S); \
 	 cp "$(ROCKET_VOL)/flight.bin" "flights/$$stamp.bin"; \
 	 echo "saved flights/$$stamp.bin ($$(stat -c%s "flights/$$stamp.bin" 2>/dev/null || stat -f%z "flights/$$stamp.bin") bytes)"
+
+# The Rust firmware (rust/rocket) moved flight logging off a FAT filesystem
+# entirely onto a raw flash partition (see rust/rocket-logic/src/flash_log.rs's
+# docs -- board-filesystem corruption was a real, recurring CircuitPython
+# problem, see docs/filesystem-recovery.md) -- there is no flight.bin file to
+# `cp` for it, so pull-log doesn't apply to a Rust-flashed rocket at all.
+# Retrieval instead means reading that partition's raw bytes over USB via
+# picotool while the board sits in its ROM bootloader -- the same double-tap-
+# RESET -> RPI-RP2 state already used to flash a new .uf2 (see
+# docs/rust-rewrite.md) -- then decoding the result with launchcast-log-decode
+# (rust/log-decode), which knows the on-flash record format because it shares
+# rust/rocket-logic's decode function rather than reimplementing it.
+#
+# Address range: rust/rocket-logic/src/flash_log.rs's LOG_PARTITION_OFFSET
+# (0x100000) through FLASH_SIZE (0x800000), offset by the RP2040's XIP base
+# (0x10000000) -- picotool addresses are memory-mapped, not flash-relative.
+LOG_PARTITION_START := 0x10100000
+LOG_PARTITION_END   := 0x10800000
+
+pull-log-rust:
+	@mkdir -p flights
+	@echo "reading the rocket's log partition via picotool -- board must be in"
+	@echo "BOOTSEL mode (double-tap RESET; same as flashing a new .uf2)."
+	@echo "7MB over USB in bootloader mode -- expect this to take a minute or so."
+	@stamp=$$(date +%Y%m%d-%H%M%S); \
+	 raw="flights/$$stamp-rust.bin"; \
+	 picotool save -r $(LOG_PARTITION_START) $(LOG_PARTITION_END) "$$raw" \
+	   || { echo "picotool failed -- is the rocket actually in BOOTSEL mode?"; exit 1; }; \
+	 cargo run --release --manifest-path rust/Cargo.toml -p launchcast-log-decode -- "$$raw" flights
+
+# Bulk-erase every flight ever recorded, not just the most recent one -- see
+# rust/rocket-logic/src/flash_log.rs's docs on why a normal DISARM-without-
+# boost can't do this itself (it only ever erases its own aborted cycle's
+# bytes, by design, never anything earlier). `picotool erase -r` operates
+# entirely offline against the flash chip while the board sits in BOOTSEL --
+# the firmware isn't even running -- so on the next boot, LogArchive's resume
+# scan finds nothing and starts write_ptr back at the partition's start,
+# exactly as if the board had never logged a flight in its life. Deliberately
+# not part of pull-log-rust, same reasoning as the CircuitPython-era
+# clean-log above: erasing every flight you've ever recorded is not something
+# to do as a side effect of retrieving one.
+clean-log-rust:
+	@echo "WARNING: this erases the ENTIRE flight-log partition -- every flight"
+	@echo "ever recorded on this board, not just the most recent one. Make sure"
+	@echo "you have already pulled anything worth keeping (make pull-log-rust)."
+	@echo "Board must be in BOOTSEL mode (double-tap RESET)."
+	@read -p "erase the whole log partition? type yes: " a; [ "$$a" = yes ]
+	picotool erase -r $(LOG_PARTITION_START) $(LOG_PARTITION_END) \
+	  || { echo "picotool failed -- is the rocket actually in BOOTSEL mode?"; exit 1; }
+	@echo "erased -- next boot resumes logging from the start of the partition."
 
 # Deliberately not part of pull-log. Erasing the only copy of a flight is not
 # something to do as a side effect.

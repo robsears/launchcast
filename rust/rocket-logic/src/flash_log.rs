@@ -38,6 +38,22 @@ pub const RECORD_SIZE: usize = 1 + 1 + PAYLOAD_SIZE + 1;
 /// RP2040 flash erase granularity -- matches `embassy_rp::flash::ERASE_SIZE`.
 pub const SECTOR_SIZE: u32 = 4096;
 
+/// Total physical flash on this board -- confirmed 8MB
+/// (GD25Q64C/W25Q64JVxQ, "Q64" = 64Mbit) via this board's CircuitPython
+/// `mpconfigboard.mk`. See `rocket/memory.x`'s docs. Pure constants, no
+/// hardware dependency, so they live here (not `rocket/src/flash_log.rs`)
+/// specifically so a host-side recovery/decode tool can share the same
+/// source of truth as the firmware instead of hand-copying these numbers
+/// and risking drift.
+pub const FLASH_SIZE: u32 = 8 * 1024 * 1024;
+/// Matches `rocket/memory.x`'s reserved boundary: the linker's `FLASH`
+/// region is capped at 1MB, so the log partition starts there and runs
+/// to the end of physical flash. The linker itself refuses to link
+/// firmware that grows past this, so it can never collide with the
+/// partition.
+pub const LOG_PARTITION_OFFSET: u32 = 1024 * 1024;
+pub const LOG_PARTITION_SIZE: u32 = FLASH_SIZE - LOG_PARTITION_OFFSET;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LogEntry {
     pub t_ms: u32,

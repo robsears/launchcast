@@ -484,8 +484,20 @@ async fn core0_task(
                 (0, Edge::Hold) => {
                     let latest = link::LINK.lock().await.latest;
                     let armed = latest.as_ref().is_some_and(|(t, _, _)| t.state == common::State::ARMED);
+                    let landed = latest.as_ref().is_some_and(|(t, _, _)| t.state == common::State::LANDED);
                     if armed {
-                        Some(common::Command::DISARM)
+                        Some((common::Command::DISARM, false))
+                    } else if landed {
+                        // "RECOVER" (screen_footer.rs's "HOLD:RECOVER") --
+                        // same wire command as DISARM, the rocket tells
+                        // the two apart by its own current state
+                        // (rocket/src/main.rs). Not gated on NOGO below:
+                        // silencing the beacon isn't a launch-safety call.
+                        // The `true` here is purely cosmetic -- it tells
+                        // cmdlog to log "SENT RECOVER.../RECOVERED OK"
+                        // instead of "SENT DISARM.../DISARMED OK", since
+                        // it's the same wire command either way.
+                        Some((common::Command::DISARM, true))
                     } else if latest.as_ref().is_some_and(|(t, _, _)| nogo_reason(t).is_some()) {
                         // Defense in depth, not the primary guard: the
                         // footer (screen_footer.rs) already suppresses
@@ -498,14 +510,14 @@ async fn core0_task(
                         // full stop.
                         None
                     } else {
-                        Some(common::Command::ARM)
+                        Some((common::Command::ARM, false))
                     }
                 }
-                (1, Edge::Tap) => Some(common::Command::CHIRP),
+                (1, Edge::Tap) => Some((common::Command::CHIRP, false)),
                 _ => None,
             };
 
-            if let Some(cmd) = cmd {
+            if let Some((cmd, recover)) = cmd {
                 seq = seq.wrapping_add(1);
                 match radio.send_command(seq, cmd).await {
                     Ok(()) => {
@@ -514,7 +526,7 @@ async fn core0_task(
                         // further -- matches code.py's `link.packets` at
                         // the moment of send, the baseline `cmdlog::poll`
                         // counts confirmation frames against.
-                        cmdlog::record_send(cmd, radio::PACKET_COUNT.load(Ordering::Relaxed)).await;
+                        cmdlog::record_send(cmd, radio::PACKET_COUNT.load(Ordering::Relaxed), recover).await;
                         // One deliberate, longer flash -- distinct from
                         // the per-packet RX flicker below -- so a command
                         // send is visually identifiable on its own.

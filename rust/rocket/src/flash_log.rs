@@ -47,19 +47,11 @@ use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant};
 use launchcast_rocket_logic::flash_log::{
-    align_up_to_sector, decode_record, encode_record, LogEntry, RECORD_SIZE, SECTOR_SIZE,
+    align_up_to_sector, decode_record, encode_record, LogEntry, FLASH_SIZE, LOG_PARTITION_OFFSET,
+    LOG_PARTITION_SIZE, RECORD_SIZE, SECTOR_SIZE,
 };
 
-/// Total physical flash on this board -- confirmed 8MB
-/// (GD25Q64C/W25Q64JVxQ, "Q64" = 64Mbit) via this board's CircuitPython
-/// `mpconfigboard.mk`. See `memory.x`'s docs.
-pub const FLASH_SIZE: usize = 8 * 1024 * 1024;
-/// Matches `memory.x`'s reserved boundary: the linker's `FLASH` region is
-/// capped at 1MB, so the log partition starts there and runs to the end
-/// of physical flash. The linker itself refuses to link firmware that
-/// grows past this, so it can never collide with the partition.
-pub const LOG_PARTITION_OFFSET: u32 = 1024 * 1024;
-pub const LOG_PARTITION_SIZE: u32 = FLASH_SIZE as u32 - LOG_PARTITION_OFFSET;
+const FLASH_SIZE_USIZE: usize = FLASH_SIZE as usize;
 
 /// Flush trigger: whichever comes first. User-specified, 2026-08-18 --
 /// covers a full boost+coast phase (worst case ~2.8s for the largest
@@ -180,7 +172,7 @@ impl LogWriter {
 /// Core0-side handle: owns the flash peripheral and the write pointer.
 /// Only this type ever calls `blocking_erase`/`blocking_write`.
 pub struct LogArchive<'d> {
-    flash: Flash<'d, FLASH, Blocking, FLASH_SIZE>,
+    flash: Flash<'d, FLASH, Blocking, FLASH_SIZE_USIZE>,
     write_ptr: u32,
     arm_cycle_start: Option<u32>,
 }
@@ -197,7 +189,7 @@ impl<'d> LogArchive<'d> {
         Self { flash, write_ptr, arm_cycle_start: None }
     }
 
-    fn scan_for_resume_point(flash: &mut Flash<'d, FLASH, Blocking, FLASH_SIZE>) -> u32 {
+    fn scan_for_resume_point(flash: &mut Flash<'d, FLASH, Blocking, FLASH_SIZE_USIZE>) -> u32 {
         let end = LOG_PARTITION_OFFSET + LOG_PARTITION_SIZE;
         let mut offset = LOG_PARTITION_OFFSET;
         let mut buf = [0u8; RECORD_SIZE];

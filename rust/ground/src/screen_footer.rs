@@ -36,6 +36,19 @@ where
             // preventing a *new* arm, never about trapping the user out
             // of disarming one that's already active.
             let _ = arm_label.push_str("HOLD:DISARM");
+        } else if frame.landed() {
+            // Same hold, same DISARM wire command -- the rocket treats
+            // DISARM-from-LANDED as "acknowledge recovery" (silence the
+            // beacon, back to IDLE) rather than the abort-and-rewind
+            // meaning DISARM has from ARMED (rocket/src/main.rs). Added
+            // 2026-08-19 after discovering there was previously no way
+            // out of LANDED short of a power cycle. Not a NOGO check
+            // below -- silencing the beacon isn't a launch-safety
+            // decision, so a low-battery/charging NOGO must never block
+            // it (not to be confused with the planned RECOVERY *screen*,
+            // an unrelated distance-tracking view -- this is the FLIGHT
+            // footer's button label).
+            let _ = arm_label.push_str("HOLD:RECOVER");
         } else if frame.nogo().is_none() {
             let _ = arm_label.push_str("HOLD:ARM");
         }
