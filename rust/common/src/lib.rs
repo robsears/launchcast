@@ -1,17 +1,18 @@
 //! LaunchCast shared packet definitions.
 //!
-//! Rust port of `common/packet.py`, the single source of truth for the wire
-//! format on both boards. If you change layout, scaling, or a constant here,
-//! check it against `common/packet.py` (and vice versa) — the Python and
-//! Rust sides must stay bit-for-bit compatible on the wire while both boards
-//! exist in mixed CircuitPython/Rust fleets during the rewrite. See
-//! `docs/rust-rewrite.md`.
+//! Was a Rust port of `common/packet.py`; as of 2026-08-19 that
+//! relationship is retired by user call -- `packet.py` (and the rest of
+//! the CircuitPython implementation) is prototyping history that's
+//! going away, not a format this crate needs to stay bit-for-bit
+//! compatible with going forward. This crate is now the single source
+//! of truth for the wire format on both boards, full stop.
 //!
 //! All multi-byte fields are little-endian with no padding, packed by hand
 //! (no external crate) so this builds `no_std`, alloc-free, on
 //! thumbv6m-none-eabi as well as the host.
 #![cfg_attr(not(test), no_std)]
 
+pub mod epoch;
 pub mod fix_average;
 pub mod nmea;
 
@@ -28,9 +29,24 @@ pub const SYNC_WORD: u8 = 0x2B;
 
 pub const PKT_TELEMETRY: u8 = 0x01;
 pub const PKT_COMMAND: u8 = 0x02;
+/// Rocket -> handheld, sent in response to a `Command::GET_SUMMARY_BASE`
+/// request. See [`pack_summary`]/[`unpack_summary`].
+pub const PKT_SUMMARY: u8 = 0x03;
+/// Rocket -> handheld, sent in response to a `Command::GET_FLIGHT_INDEX`
+/// request. See [`pack_flight_index`]/[`unpack_flight_index`].
+pub const PKT_FLIGHT_INDEX: u8 = 0x04;
 
 pub const TELEMETRY_SIZE: usize = 40;
 pub const COMMAND_SIZE: usize = 7;
+pub const SUMMARY_SIZE: usize = 67;
+/// magic + pkt_type + count -- see [`pack_flight_index`].
+const FLIGHT_INDEX_HEADER_SIZE: usize = 3;
+/// Largest a [`PKT_FLIGHT_INDEX`] frame can ever be, at
+/// `MAX_STORED_FLIGHTS` entries -- the actual size on the wire is
+/// smaller whenever fewer flights are stored (see that constant's docs
+/// on why this packet is variable-length instead of always paying for
+/// the max).
+pub const FLIGHT_INDEX_MAX_SIZE: usize = FLIGHT_INDEX_HEADER_SIZE + MAX_STORED_FLIGHTS as usize * 4;
 
 // --- Telemetry: rocket -> handheld -------------------------------------------
 //
@@ -50,7 +66,7 @@ pub const COMMAND_SIZE: usize = 7;
 //  29      gyro x,y,z   i16*3    deci-degrees/s
 //  35      batt         u8       (volts - 3.0) * 100
 //  36      gps_flags    u8       bit0 = fix, bits 1-5 = sat count
-//  37      cam_rec      u8       reserved, send 0
+//  37      flight_count u8       stored flights available via GET_SUMMARY (0 = none/unset)
 //  38      sensors      u8       Sensor::* bitfield
 //  39      fw_version   u8       rocket firmware build counter (0 = unset)
 //                                                     total: 40 bytes
@@ -73,7 +89,14 @@ pub struct TelemetryInput {
     pub batt_volts: f32,
     pub has_fix: bool,
     pub satellites: u8,
-    pub cam_rec: u8,
+    /// Former reserved field (`cam_rec`, always 0, never populated by
+    /// anything -- from the same never-built camera concept `fw_version`'s
+    /// byte came from). Repurposed 2026-08-19: how many completed flight
+    /// summaries are currently available via `Command::GET_SUMMARY_BASE`
+    /// (see `flight_summary.rs`) -- the ground station uses "nonzero" as
+    /// the gate for whether the FLIGHTS screen even appears in the menu
+    /// rotation.
+    pub flight_count: u8,
     pub sensors: u8,
     /// Rocket firmware build counter -- byte 39 of the wire format, a
     /// former reserved field (`cam_disk`, always 0, never populated by
@@ -100,7 +123,7 @@ pub struct Telemetry {
     pub batt_volts: f32,
     pub has_fix: bool,
     pub satellites: u8,
-    pub cam_rec: bool,
+    pub flight_count: u8,
     pub sensors: u8,
     pub fw_version: u8,
 }
@@ -138,7 +161,7 @@ pub fn pack_telemetry(input: &TelemetryInput) -> [u8; TELEMETRY_SIZE] {
 
     buf[35] = encode_batt(input.batt_volts);
     buf[36] = encode_gps_flags(input.has_fix, input.satellites);
-    buf[37] = input.cam_rec;
+    buf[37] = input.flight_count;
     buf[38] = input.sensors;
     buf[39] = input.fw_version;
 
@@ -173,7 +196,7 @@ pub fn unpack_telemetry(data: &[u8]) -> Option<Telemetry> {
     let gz = i16::from_le_bytes(data[33..35].try_into().unwrap());
     let batt = data[35];
     let gps_flags = data[36];
-    let cam_rec = data[37];
+    let flight_count = data[37];
     let sensors = data[38];
     let fw_version = data[39];
 
@@ -193,10 +216,186 @@ pub fn unpack_telemetry(data: &[u8]) -> Option<Telemetry> {
         batt_volts: decode_batt(batt),
         has_fix,
         satellites,
-        cam_rec: cam_rec != 0,
+        flight_count,
         sensors,
         fw_version,
     })
+}
+
+// --- Summary: rocket -> handheld (one flight's highlights) -------------------
+//
+// Sent in response to a Command::GET_SUMMARY_BASE request -- see
+// rocket-logic::flight_summary for what these fields mean operationally
+// and why the two GPS fixes are captured when they are.
+//
+//  offset  field          type   units on wire
+//  ------  -------------  -----  --------------------------------
+//   0      magic          u8     0xA5
+//   1      pkt_type       u8     0x03
+//   2      flight_index   u8     which stored flight this answers
+//   3      wait_ms        u32    ARM -> BOOST
+//   7      boost_ms       u32    BOOST -> COAST
+//  11      coast_ms       u32    COAST -> APOGEE
+//  15      descent_ms     u32    DESCENT -> LANDED
+//  19      arm_lat        f32    degrees, averaged fix at ARM
+//  23      arm_lon        f32    degrees
+//  27      landed_lat     f32    degrees, averaged fix locked in at RECOVER
+//  31      landed_lon     f32    degrees
+//  35      max_speed_mps  f32
+//  39      max_alt_m      f32
+//  43      temp_at_max_alt_c        f32
+//  47      pressure_at_max_alt_hpa  f32
+//  51      max_accel_g    f32
+//  55      max_gyro_dps   f32
+//  59      record_count   u32    log entries written this flight
+//  63      arm_epoch_s    u32    unix seconds at ARM; 0 = no wall clock yet
+//                                                     total: 67 bytes
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SummaryInput {
+    pub flight_index: u8,
+    pub wait_ms: u32,
+    pub boost_ms: u32,
+    pub coast_ms: u32,
+    pub descent_ms: u32,
+    pub arm_lat: f32,
+    pub arm_lon: f32,
+    pub landed_lat: f32,
+    pub landed_lon: f32,
+    pub max_speed_mps: f32,
+    pub max_alt_m: f32,
+    /// Temperature/pressure at the moment `max_alt_m` was recorded, not
+    /// independent extremes of their own -- see
+    /// `rocket-logic::flight_summary::FlightSummary::observe`'s docs.
+    pub temp_at_max_alt_c: f32,
+    pub pressure_at_max_alt_hpa: f32,
+    pub max_accel_g: f32,
+    pub max_gyro_dps: f32,
+    pub record_count: u32,
+    /// Unix seconds at ARM, from the rocket's own `EpochOffset` (see
+    /// `common::epoch`) -- `0` if the rocket had no wall-clock reference
+    /// yet at ARM time (no GPS fix since boot).
+    pub arm_epoch_s: u32,
+}
+
+pub type Summary = SummaryInput;
+
+/// Build a 67-byte flight-summary frame.
+pub fn pack_summary(input: &SummaryInput) -> [u8; SUMMARY_SIZE] {
+    let mut buf = [0u8; SUMMARY_SIZE];
+
+    buf[0] = MAGIC;
+    buf[1] = PKT_SUMMARY;
+    buf[2] = input.flight_index;
+    buf[3..7].copy_from_slice(&input.wait_ms.to_le_bytes());
+    buf[7..11].copy_from_slice(&input.boost_ms.to_le_bytes());
+    buf[11..15].copy_from_slice(&input.coast_ms.to_le_bytes());
+    buf[15..19].copy_from_slice(&input.descent_ms.to_le_bytes());
+    buf[19..23].copy_from_slice(&input.arm_lat.to_le_bytes());
+    buf[23..27].copy_from_slice(&input.arm_lon.to_le_bytes());
+    buf[27..31].copy_from_slice(&input.landed_lat.to_le_bytes());
+    buf[31..35].copy_from_slice(&input.landed_lon.to_le_bytes());
+    buf[35..39].copy_from_slice(&input.max_speed_mps.to_le_bytes());
+    buf[39..43].copy_from_slice(&input.max_alt_m.to_le_bytes());
+    buf[43..47].copy_from_slice(&input.temp_at_max_alt_c.to_le_bytes());
+    buf[47..51].copy_from_slice(&input.pressure_at_max_alt_hpa.to_le_bytes());
+    buf[51..55].copy_from_slice(&input.max_accel_g.to_le_bytes());
+    buf[55..59].copy_from_slice(&input.max_gyro_dps.to_le_bytes());
+    buf[59..63].copy_from_slice(&input.record_count.to_le_bytes());
+    buf[63..67].copy_from_slice(&input.arm_epoch_s.to_le_bytes());
+
+    buf
+}
+
+/// Decode a flight-summary frame, or `None` if it isn't ours.
+pub fn unpack_summary(data: &[u8]) -> Option<Summary> {
+    if data.len() != SUMMARY_SIZE {
+        return None;
+    }
+    if data[0] != MAGIC || data[1] != PKT_SUMMARY {
+        return None;
+    }
+
+    let f32_at = |off: usize| f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let u32_at = |off: usize| u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+
+    Some(Summary {
+        flight_index: data[2],
+        wait_ms: u32_at(3),
+        boost_ms: u32_at(7),
+        coast_ms: u32_at(11),
+        descent_ms: u32_at(15),
+        arm_lat: f32_at(19),
+        arm_lon: f32_at(23),
+        landed_lat: f32_at(27),
+        landed_lon: f32_at(31),
+        max_speed_mps: f32_at(35),
+        max_alt_m: f32_at(39),
+        temp_at_max_alt_c: f32_at(43),
+        pressure_at_max_alt_hpa: f32_at(47),
+        max_accel_g: f32_at(51),
+        max_gyro_dps: f32_at(55),
+        record_count: u32_at(59),
+        arm_epoch_s: u32_at(63),
+    })
+}
+
+// --- Flight index: rocket -> handheld (which flights are stored, and when) ---
+//
+// Sent in response to a Command::GET_FLIGHT_INDEX request -- the ground
+// station's actual source of truth for what's available to request via
+// GET_SUMMARY_BASE, replacing any assumption based on a possibly-stale
+// telemetry byte. Variable length, unlike every other packet in this
+// file -- see FLIGHT_INDEX_MAX_SIZE's docs on why.
+//
+//  offset  field        type   notes
+//  ------  -----------  -----  --------------------------------
+//   0      magic        u8     0xA5
+//   1      pkt_type     u8     0x04
+//   2      count        u8     0..=MAX_STORED_FLIGHTS
+//   3..    epoch_s[i]   u32    unix seconds at ARM, oldest first, `count` of them
+//                                     total: 3 + count*4 bytes
+
+/// Build a flight-index frame from an ordered (oldest-first) list of
+/// ARM unix-second timestamps -- one per currently-stored flight, same
+/// index convention `Command::GET_SUMMARY_BASE` uses. Silently caps at
+/// `MAX_STORED_FLIGHTS` entries if handed more (should never happen --
+/// the rocket's own storage is capped at that size already).
+pub fn pack_flight_index(timestamps: &[u32]) -> heapless::Vec<u8, FLIGHT_INDEX_MAX_SIZE> {
+    let mut buf: heapless::Vec<u8, FLIGHT_INDEX_MAX_SIZE> = heapless::Vec::new();
+    let count = timestamps.len().min(MAX_STORED_FLIGHTS as usize);
+    let _ = buf.push(MAGIC);
+    let _ = buf.push(PKT_FLIGHT_INDEX);
+    let _ = buf.push(count as u8);
+    for &ts in &timestamps[..count] {
+        let _ = buf.extend_from_slice(&ts.to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a flight-index frame, or `None` if it isn't ours or its
+/// declared `count` doesn't match the actual payload length.
+pub fn unpack_flight_index(data: &[u8]) -> Option<heapless::Vec<u32, { MAX_STORED_FLIGHTS as usize }>> {
+    if data.len() < FLIGHT_INDEX_HEADER_SIZE {
+        return None;
+    }
+    if data[0] != MAGIC || data[1] != PKT_FLIGHT_INDEX {
+        return None;
+    }
+    let count = data[2] as usize;
+    if count > MAX_STORED_FLIGHTS as usize || data.len() != FLIGHT_INDEX_HEADER_SIZE + count * 4 {
+        return None;
+    }
+
+    let mut out = heapless::Vec::new();
+    for i in 0..count {
+        let off = FLIGHT_INDEX_HEADER_SIZE + i * 4;
+        let ts = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        // Capacity is MAX_STORED_FLIGHTS and count was just checked
+        // against it, so this can never fail.
+        let _ = out.push(ts);
+    }
+    Some(out)
 }
 
 // --- Command: handheld -> rocket ---------------------------------------------
@@ -251,6 +450,15 @@ pub fn unpack_command(data: &[u8]) -> Option<(u16, u8)> {
     Some((seq, cmd))
 }
 
+/// How many completed flights the rocket keeps in RAM, and (since
+/// `Command::GET_SUMMARY_BASE`'s value directly encodes the flight index
+/// requested rather than carrying a separate parameter byte) the number
+/// of command-byte values reserved for that purpose. Oldest evicted once
+/// full; cleared on power cycle -- see `flight_summary.rs`'s docs on why
+/// that's an acceptable tradeoff (the raw log partition remains the
+/// durable source of truth regardless).
+pub const MAX_STORED_FLIGHTS: u8 = 32;
+
 pub struct Command;
 
 impl Command {
@@ -260,8 +468,28 @@ impl Command {
     pub const CHIRP: u8 = 0x01;
     /// IDLE -> ARMED.
     pub const ARM: u8 = 0x02;
-    /// ARMED -> IDLE.
+    /// ARMED -> IDLE (from ARMED: abort, rewinds the log; from LANDED:
+    /// RECOVER, silences the beacon -- rocket tells the two apart by its
+    /// own current state, see `rocket/src/main.rs`).
     pub const DISARM: u8 = 0x03;
+    /// Request flight N's summary: send
+    /// `GET_SUMMARY_BASE + N` (`N` in `0..MAX_STORED_FLIGHTS`) as the
+    /// command byte -- the value itself *is* the flight index, there's
+    /// no separate parameter field on the 7-byte command packet.
+    /// Answered with a [`PKT_SUMMARY`] frame carrying the same index, or
+    /// not answered at all if that index has nothing stored (the ground
+    /// station's existing pending-command timeout already covers "no
+    /// response arrived").
+    pub const GET_SUMMARY_BASE: u8 = 0x20;
+    /// Request the ordered list of ARM timestamps for every flight
+    /// currently stored -- see [`pack_flight_index`]/
+    /// [`unpack_flight_index`]. Answered with a [`PKT_FLIGHT_INDEX`]
+    /// frame. This is the ground station's actual source of truth for
+    /// "what flights exist and at what index" -- not a cached count
+    /// from telemetry, which can't distinguish a real answer from a
+    /// rocket that's since power-cycled and lost its RAM-only stored
+    /// flights.
+    pub const GET_FLIGHT_INDEX: u8 = 0x05;
 }
 
 // --- Flight state machine ----------------------------------------------------

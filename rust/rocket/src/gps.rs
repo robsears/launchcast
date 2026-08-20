@@ -33,9 +33,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use embedded_hal::i2c::I2c;
 use heapless::String;
+use launchcast_common::epoch::EpochOffset;
 use launchcast_common::fix_average::FixAverage;
 use launchcast_common::nmea::{framed_command, parse_rmc, NmeaLineReader};
 use launchcast_common::State;
@@ -95,6 +96,12 @@ pub static GPS_FIX: Mutex<CriticalSectionRawMutex, GpsFix> = Mutex::new(GpsFix {
     lat: 0.0,
     lon: 0.0,
 });
+
+/// Wall-clock reference, captured once on this board's first valid fix
+/// with a decoded UTC time -- see `common::epoch`'s docs. `None` until
+/// then; read by `main.rs`'s flight_task to timestamp each flight's ARM
+/// moment for `Command::GET_FLIGHT_INDEX`/`PKT_SUMMARY`.
+pub static EPOCH_OFFSET: Mutex<CriticalSectionRawMutex, Option<EpochOffset>> = Mutex::new(None);
 
 fn send_command<I: I2c>(i2c: &mut I, payload: &str) {
     let cmd: String<48> = framed_command(payload);
@@ -156,6 +163,18 @@ pub async fn gps_task(mut i2c: crate::i2c_bus::SharedI2cDevice) {
                     } else {
                         g.lat = fix.lat;
                         g.lon = fix.lon;
+                    }
+                    drop(g);
+
+                    // Capture the wall-clock reference on the first
+                    // valid fix that has one -- see EPOCH_OFFSET's docs
+                    // and common::epoch's module docs on why this never
+                    // gets recomputed after.
+                    if let Some(utc) = fix.utc {
+                        let mut offset = EPOCH_OFFSET.lock().await;
+                        if offset.is_none() {
+                            *offset = Some(EpochOffset::capture(&utc, Instant::now().as_millis() as u32));
+                        }
                     }
                 }
             }

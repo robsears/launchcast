@@ -44,6 +44,7 @@ mod buttons;
 mod cmdlog;
 mod display;
 mod display_util;
+mod flight_index;
 mod frame;
 mod gps;
 mod handheld_art;
@@ -57,10 +58,13 @@ mod rocket_art;
 mod screen;
 mod screen_diagnostics;
 mod screen_flight;
+mod screen_flights;
 mod screen_footer;
 mod screen_header;
 mod screen_missing;
 mod screen_recovery;
+mod screen_summary;
+mod summary_request;
 
 use core::ptr::addr_of_mut;
 
@@ -85,7 +89,7 @@ use embassy_time::{Delay, Instant, Timer};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use launchcast_common as common;
-use launchcast_ground_logic::{link_status, nogo_reason, telemetry_missing, Edge};
+use launchcast_ground_logic::{link_status, nogo_reason, telemetry_missing, Edge, LinkStatus};
 use panic_probe as _;
 use portable_atomic::Ordering;
 use static_cell::StaticCell;
@@ -298,24 +302,52 @@ async fn button_task(
 
         for event in fired.into_iter().flatten() {
             match event {
-                // MENU: always advances, entirely local to core1 (only
-                // ever touches the display) -- never forwarded.
+                // MENU on SUMMARY goes back to FLIGHTS specifically, not
+                // the next screen in the normal rotation -- and clears
+                // any stale request state so a leftover Ready/Failed
+                // from the last selection doesn't flash up early next
+                // time. Entirely local, matching MENU's usual reach.
+                (2, Edge::Tap) if screen::current() == screen::SUMMARY => {
+                    screen::to_flights();
+                    summary_request::reset().await;
+                }
+                // MENU elsewhere: always advances, entirely local to
+                // core1 (only ever touches the display) -- never
+                // forwarded.
                 (2, Edge::Tap) => screen::advance(),
-                // ARM/DISARM-as-BACK: off FLIGHT, either gesture
-                // navigates back immediately -- a tap, not the full 2s
-                // hold, since there's no command to arm on these
-                // screens to guard against a mis-press. Entirely local,
-                // and specifically NOT forwarded, so core0 never sees an
-                // ARM/DISARM press that doesn't actually mean "send it".
+                // FLIGHTS: button 0 cycles the list cursor instead of
+                // its usual "go back" meaning. A tap suffices -- nothing
+                // here needs a hold's mis-press guard, there's no
+                // command firing from a mere selection change.
+                (0, Edge::Tap) if screen::current() == screen::FLIGHTS => {
+                    let count = flight_index::FLIGHT_INDEX.lock().await.count();
+                    screen::cycle_selected(count);
+                }
+                // SUMMARY: both buttons besides MENU are inert by design
+                // (see screen_footer.rs) -- swallow them here rather
+                // than falling through to ARM/DISARM-as-BACK or a
+                // forwarded CHIRP.
+                (0 | 1, _) if screen::current() == screen::SUMMARY => {}
+                // ARM/DISARM-as-BACK: off FLIGHT (and not FLIGHTS/
+                // SUMMARY, both handled above), either gesture navigates
+                // back immediately -- a tap, not the full 2s hold, since
+                // there's no command to arm on these screens to guard
+                // against a mis-press. Entirely local, and specifically
+                // NOT forwarded, so core0 never sees an ARM/DISARM press
+                // that doesn't actually mean "send it".
                 (0, _) if screen::current() != screen::FLIGHT => screen::back(),
                 // On FLIGHT, only a genuine hold means "send ARM/DISARM"
                 // -- a mere tap here does nothing, matching code.py
                 // (which only ever dispatches this button on
                 // `event == "hold"`).
                 (0, Edge::Tap) => {}
-                // Everything else needs the radio: CHIRP always, and
-                // ARM/DISARM holds that got here specifically because
-                // we're on FLIGHT.
+                // Everything else needs the radio: CHIRP (on FLIGHT or
+                // FLIGHTS -- FLIGHTS' meaning, "select and request this
+                // flight's summary," is resolved core0-side, see
+                // main.rs's button-forwarding handler, since it needs
+                // screen::selected() and the radio, both already
+                // reachable from there) and ARM/DISARM holds that got
+                // here specifically because we're on FLIGHT.
                 _ => events_out.send(event).await,
             }
         }
@@ -350,6 +382,15 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
     let my_gps = *gps::MY_GPS.lock().await;
     let my_batt = *battery::MY_BATT.lock().await;
     let cmd_log = cmdlog::snapshot().await;
+    let summary_request_state = *summary_request::REQUEST.lock().await;
+    let flight_index_snapshot = flight_index::FLIGHT_INDEX.lock().await;
+    let flight_index_state = flight_index_snapshot.state;
+    let prefetch_progress = flight_index_snapshot.prefetch_progress();
+    drop(flight_index_snapshot);
+    let my_wall_clock_ms = gps::EPOCH_OFFSET
+        .lock()
+        .await
+        .map(|o| o.wall_clock_ms(Instant::now().as_millis() as u32));
 
     let now = Instant::now();
     let age_ms = link.age_ms(now);
@@ -373,6 +414,7 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
         // supervisor.runtime.usb_connected has no bare-metal equivalent
         // wired up yet -- see battery.rs's docs.
         my_charging: false,
+        my_wall_clock_ms,
         // ARM/DISARM pending-confirmation status (code.py's `tx_status`,
         // `CMD_CONFIRM_FRAMES`) -- see cmdlog.rs, driven from core0_task.
         tx_status: if cmd_log.tx_status.is_empty() {
@@ -384,6 +426,10 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
         screen_name: screen::current_name(),
         next_screen_name: screen::next_name(),
         prev_screen_name: screen::prev_name(),
+        selected_flight: screen::selected(),
+        summary_request: summary_request_state,
+        flight_index_state,
+        prefetch_progress,
     };
 
     screen_header::draw(display, &frame);
@@ -398,12 +444,13 @@ async fn draw_current_screen(display: &mut display::SharpMemoryDisplay<'static, 
         match screen::current() {
             screen::RECOVERY => screen_recovery::draw(display, &frame),
             screen::DIAG => screen_diagnostics::draw(display, &frame, t),
+            screen::FLIGHTS => screen_flights::draw(display, &frame),
+            screen::SUMMARY => screen_summary::draw(display, &frame),
             _ => screen_flight::draw(display, &frame, t),
         }
     }
 
-    let is_flight = screen::current() == screen::FLIGHT;
-    screen_footer::draw(display, &frame, is_flight, frame.prev_screen_name);
+    screen_footer::draw(display, &frame, screen::current(), frame.prev_screen_name);
 }
 
 #[embassy_executor::task]
@@ -475,19 +522,83 @@ async fn core0_task(
                 buttons::edge_name(edge)
             );
 
+            // FLIGHTS' CHIRP-button meaning when the cache came back
+            // genuinely empty ("TAP:REFRESH", see screen_footer.rs) --
+            // there's nothing to select, so re-check with the rocket
+            // instead. Just an invalidate: the auto-fetch condition in
+            // this same loop (below) picks up the resulting `Idle` state
+            // on its very next tick since we're still on FLIGHTS with a
+            // live link, no direct `GET_FLIGHT_INDEX` send needed here.
+            if (key_number, edge) == (1, Edge::Tap)
+                && screen::current() == screen::FLIGHTS
+                && flight_index::FLIGHT_INDEX.lock().await.state == flight_index::IndexState::Empty
+            {
+                flight_index::invalidate().await;
+                continue;
+            }
+
+            // FLIGHTS' CHIRP-button meaning ("select the highlighted
+            // flight, request its summary") is resolved here rather
+            // than in the generic cmd match below -- it isn't a
+            // Command::* at all until this point (the index is only
+            // known here, via screen::selected()), and its post-send
+            // bookkeeping (summary_request::start, not cmdlog) and
+            // screen transition are both different from every other
+            // forwarded button press.
+            if (key_number, edge) == (1, Edge::Tap) && screen::current() == screen::FLIGHTS {
+                let idx = screen::selected();
+                // Already cached (revisiting a flight already viewed
+                // this session)? Jump straight to SUMMARY with no radio
+                // round trip at all -- see flight_index.rs's docs.
+                let cached = flight_index::FLIGHT_INDEX.lock().await.cached_summary(idx);
+                if let Some(summary) = cached {
+                    summary_request::show_cached(summary).await;
+                    screen::to_summary();
+                } else {
+                    seq = seq.wrapping_add(1);
+                    match radio.send_command(seq, common::Command::GET_SUMMARY_BASE + idx).await {
+                        Ok(()) => {
+                            summary_request::start(idx, radio::PACKET_COUNT.load(Ordering::Relaxed)).await;
+                            screen::to_summary();
+                        }
+                        Err(e) => defmt::error!("core0: send_command (get_summary) failed: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // DIAG's CHIRP-button meaning ("manually invalidate the
+            // flight cache") -- repurposed there specifically (see
+            // screen_footer.rs) rather than sending CHIRP, which DIAG
+            // has less use for than a debug-oriented forced rebuild.
+            if (key_number, edge) == (1, Edge::Tap) && screen::current() == screen::DIAG {
+                flight_index::invalidate().await;
+                continue;
+            }
+
             let cmd = match (key_number, edge) {
                 // ARM/DISARM share one button (a 2s hold), so which one
-                // this hold means depends on the last known rocket state
-                // -- exactly equal to ARMED, not `>=`, since once flight
-                // is underway (BOOST and beyond) a stray hold shouldn't
-                // read as "send DISARM".
+                // this hold means depends on the last known rocket state:
+                // exactly ARMED means abort-and-rewind; anything past
+                // that (BOOST through LANDED -- see Frame::recoverable,
+                // broadened 2026-08-19 so a flight stuck mid-state-
+                // machine isn't unrecoverable) means RECOVER instead.
                 (0, Edge::Hold) => {
                     let latest = link::LINK.lock().await.latest;
                     let armed = latest.as_ref().is_some_and(|(t, _, _)| t.state == common::State::ARMED);
-                    let landed = latest.as_ref().is_some_and(|(t, _, _)| t.state == common::State::LANDED);
+                    let recoverable = latest.as_ref().is_some_and(|(t, _, _)| {
+                        matches!(
+                            t.state,
+                            common::State::BOOST
+                                | common::State::COAST
+                                | common::State::APOGEE
+                                | common::State::DESCENT
+                                | common::State::LANDED
+                        )
+                    });
                     if armed {
                         Some((common::Command::DISARM, false))
-                    } else if landed {
+                    } else if recoverable {
                         // "RECOVER" (screen_footer.rs's "HOLD:RECOVER") --
                         // same wire command as DISARM, the rocket tells
                         // the two apart by its own current state
@@ -539,8 +650,8 @@ async fn core0_task(
             }
         }
 
-        match radio.try_receive_telemetry().await {
-            Ok(Some(radio::RxResult { telemetry, rssi, snr })) => {
+        match radio.try_receive_frame().await {
+            Ok(Some(radio::RxFrame::Telemetry(radio::RxResult { telemetry, rssi, snr }))) => {
                 defmt::info!(
                     "core0: telemetry counter={} state={}",
                     telemetry.counter,
@@ -559,12 +670,30 @@ async fn core0_task(
                 // heartbeat proving live RX without needing a probe.
                 led.toggle();
             }
+            Ok(Some(radio::RxFrame::Summary(radio::SummaryRxResult { summary, rssi, snr }))) => {
+                defmt::info!("core0: summary flight_index={} rssi={} snr={}", summary.flight_index, rssi, snr);
+                radio::log_line(format_args!("SUMMARY flight {} rssi={rssi} snr={snr}", summary.flight_index)).await;
+                summary_request::record_response(summary).await;
+                // Also persist into the durable per-flight cache -- see
+                // flight_index.rs's docs on the split between that (the
+                // cache) and summary_request (the current request's
+                // transient UI status).
+                flight_index::record_summary(summary).await;
+                led.toggle();
+            }
+            Ok(Some(radio::RxFrame::FlightIndex(radio::FlightIndexRxResult { timestamps }))) => {
+                defmt::info!("core0: flight_index count={}", timestamps.len());
+                radio::log_line(format_args!("FLIGHT_INDEX count={}", timestamps.len())).await;
+                flight_index::record_response(&timestamps).await;
+                led.toggle();
+            }
             // Timeout (nothing arrived this ~0.5s window) or a frame that
-            // failed unpack_telemetry's validation -- both normal and not
+            // failed unpack_telemetry's, unpack_summary's, and
+            // unpack_flight_index's validation -- all normal and not
             // worth logging every cycle.
             Ok(None) => {}
             Err(e) => {
-                defmt::error!("core0: try_receive_telemetry failed: {}", e);
+                defmt::error!("core0: try_receive_frame failed: {}", e);
                 // TEMP diagnostic: blink the error's code (see
                 // radio::error_blink_code) so the specific RadioError
                 // variant can be identified and reported back without a
@@ -587,6 +716,56 @@ async fn core0_task(
         let snapshot = *link::LINK.lock().await;
         let current_state = snapshot.latest.as_ref().map(|(t, _, _)| t.state);
         let status = link_status(snapshot.age_ms(Instant::now()));
-        cmdlog::poll(current_state, radio::PACKET_COUNT.load(Ordering::Relaxed), status).await;
+        let outcome = cmdlog::poll(current_state, radio::PACKET_COUNT.load(Ordering::Relaxed), status).await;
+        if outcome == Some(cmdlog::PollOutcome::RecoverSucceeded) {
+            // A new flight was just archived on the rocket -- whatever
+            // FLIGHTS/SUMMARY have cached is now stale. See
+            // flight_index.rs's docs on this being one of its two
+            // invalidation triggers.
+            flight_index::invalidate().await;
+        }
+        summary_request::poll_timeout(radio::PACKET_COUNT.load(Ordering::Relaxed), status).await;
+        flight_index::poll_timeout(radio::PACKET_COUNT.load(Ordering::Relaxed), status).await;
+
+        // -- auto-fetch the flight index whenever FLIGHTS needs one and
+        // doesn't have one -------------------------------------------------
+        // Checked every iteration rather than on a screen-transition
+        // edge -- simpler and more robust than trying to detect "just
+        // navigated here" across the core1/core0 boundary, and it
+        // naturally covers both "just navigated to FLIGHTS" and "cache
+        // just got invalidated while already there." See
+        // flight_index.rs's docs.
+        let idle_and_on_flights = {
+            let idx = flight_index::FLIGHT_INDEX.lock().await;
+            idx.state == flight_index::IndexState::Idle && screen::current() == screen::FLIGHTS
+        };
+        if idle_and_on_flights && matches!(status, LinkStatus::Live | LinkStatus::Stale) {
+            seq = seq.wrapping_add(1);
+            match radio.send_command(seq, common::Command::GET_FLIGHT_INDEX).await {
+                Ok(()) => flight_index::start_fetch(radio::PACKET_COUNT.load(Ordering::Relaxed)).await,
+                Err(e) => defmt::error!("core0: send_command (get_flight_index) failed: {}", e),
+            }
+        }
+
+        // -- background summary prefetch -------------------------------
+        // Once the index itself is Ready, walk every not-yet-cached
+        // flight in the background so a full review works later with
+        // the rocket powered off -- see flight_index.rs's docs. Not
+        // gated on the FLIGHTS screen (unlike the index fetch above):
+        // the whole point is to keep making progress even after the
+        // user has moved on to another screen. Skipped while a manual
+        // FLIGHTS selection has its own request outstanding -- only one
+        // GET_SUMMARY_BASE in flight at a time on this half-duplex link.
+        let manual_request_pending =
+            matches!(*summary_request::REQUEST.lock().await, summary_request::SummaryRequest::Pending { .. });
+        if !manual_request_pending && matches!(status, LinkStatus::Live | LinkStatus::Stale) {
+            if let Some(idx) = flight_index::next_to_prefetch().await {
+                seq = seq.wrapping_add(1);
+                match radio.send_command(seq, common::Command::GET_SUMMARY_BASE + idx).await {
+                    Ok(()) => flight_index::start_prefetch(idx, radio::PACKET_COUNT.load(Ordering::Relaxed)).await,
+                    Err(e) => defmt::error!("core0: send_command (prefetch summary) failed: {}", e),
+                }
+            }
+        }
     }
 }

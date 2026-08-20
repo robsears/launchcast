@@ -130,6 +130,49 @@ impl Radio {
         self.lora.tx().await
     }
 
+    /// Broadcast one flight-summary frame, in response to a
+    /// `Command::GET_SUMMARY_BASE` request. Same shape as
+    /// [`Radio::send_telemetry`] -- explicit-header mode means
+    /// `tx_pkt_params` isn't tied to a fixed payload length, so the same
+    /// params are reused for this differently-sized frame with no
+    /// separate `PacketParams` needed.
+    pub async fn send_summary(&mut self, input: &common::SummaryInput) -> Result<(), RadioError> {
+        let payload = common::pack_summary(input);
+        let mut buf = [0u8; RH_HEADER_LEN + common::SUMMARY_SIZE];
+        buf[0] = RH_BROADCAST; // to
+        buf[1] = RH_BROADCAST; // from
+        buf[2] = 0; // id
+        buf[3] = 0; // flags
+        buf[RH_HEADER_LEN..].copy_from_slice(&payload);
+
+        self.lora
+            .prepare_for_tx(&self.mdltn_params, &mut self.tx_pkt_params, TX_POWER_DBM, &buf)
+            .await?;
+        self.lora.tx().await
+    }
+
+    /// Broadcast one flight-index frame, in response to
+    /// `Command::GET_FLIGHT_INDEX`. Variable length, unlike
+    /// [`Radio::send_summary`]/[`Radio::send_telemetry`] -- see
+    /// `common::pack_flight_index`'s docs -- so this builds a
+    /// `heapless::Vec` sized for the worst case instead of a fixed
+    /// array; explicit-header LoRa mode means `tx_pkt_params` doesn't
+    /// care that the actual length varies call to call.
+    pub async fn send_flight_index(&mut self, timestamps: &[u32]) -> Result<(), RadioError> {
+        let payload = common::pack_flight_index(timestamps);
+        let mut buf: heapless::Vec<u8, { RH_HEADER_LEN + common::FLIGHT_INDEX_MAX_SIZE }> = heapless::Vec::new();
+        let _ = buf.push(RH_BROADCAST); // to
+        let _ = buf.push(RH_BROADCAST); // from
+        let _ = buf.push(0); // id
+        let _ = buf.push(0); // flags
+        let _ = buf.extend_from_slice(&payload);
+
+        self.lora
+            .prepare_for_tx(&self.mdltn_params, &mut self.tx_pkt_params, TX_POWER_DBM, &buf)
+            .await?;
+        self.lora.tx().await
+    }
+
     /// Listen for one command frame for up to `RX_SYMBOL_TIMEOUT` symbols
     /// (roughly half a second). `Ok(None)` on a plain timeout or a frame
     /// that fails `unpack_command`'s own validation (magic/checksum) --

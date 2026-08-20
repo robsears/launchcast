@@ -11,6 +11,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - run: |
-          nix develop --accept-flake-config --command ruff check -- .
-      - run: |
-          nix develop --accept-flake-config --command python -m pytest -- tests/
+          nix run --accept-flake-config .#check

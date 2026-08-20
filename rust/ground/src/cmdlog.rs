@@ -109,34 +109,53 @@ pub async fn record_send(cmd: u8, packets_at_send: u32, recover: bool) {
     }
 }
 
+/// What a call to [`poll`] just did -- `None` when nothing was pending
+/// or nothing changed this call. `RecoverSucceeded` specifically is what
+/// `flight_index.rs` watches for to auto-invalidate its cache: a
+/// successful RECOVER means the rocket just archived a new flight, so
+/// whatever list/summaries the ground has cached are now out of date.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PollOutcome {
+    ArmSucceeded,
+    DisarmSucceeded,
+    RecoverSucceeded,
+    Failed,
+}
+
 /// Resolve (or keep waiting on) a pending ARM/DISARM, given the rocket's
 /// last-known state, the live packet counter, and the link's freshness
-/// bucket. A no-op whenever nothing is pending. Matches `code.py`
-/// ~L480-494 -- call this once per core0 loop iteration, not just when a
-/// new frame arrives, so the link-lost branch can still fire on its own.
-pub async fn poll(current_state: Option<u8>, packets_now: u32, status: LinkStatus) {
+/// bucket. Returns `None` whenever nothing was pending or nothing
+/// changed this call. Matches `code.py` ~L480-494 -- call this once per
+/// core0 loop iteration, not just when a new frame arrives, so the
+/// link-lost branch can still fire on its own.
+pub async fn poll(current_state: Option<u8>, packets_now: u32, status: LinkStatus) -> Option<PollOutcome> {
     let mut log = CMD_LOG.lock().await;
-    let Some(pending) = log.pending else {
-        return;
-    };
+    let pending = log.pending?;
 
     if current_state == Some(pending.want) {
         log.pending = None;
-        log.push_status(if pending.want == common::State::ARMED {
-            "ARMED OK"
+        if pending.want == common::State::ARMED {
+            log.push_status("ARMED OK");
+            Some(PollOutcome::ArmSucceeded)
         } else if pending.recover {
-            "RECOVERED OK"
+            log.push_status("RECOVERED OK");
+            Some(PollOutcome::RecoverSucceeded)
         } else {
-            "DISARMED OK"
-        });
+            log.push_status("DISARMED OK");
+            Some(PollOutcome::DisarmSucceeded)
+        }
     } else if packets_now.wrapping_sub(pending.packets_at_send) >= CMD_CONFIRM_FRAMES {
         log.pending = None;
         log.push_status("CMD FAILED -- retry");
+        Some(PollOutcome::Failed)
     } else if status == LinkStatus::Lost {
         // The branch above can't fire if no frames are arriving at all to
         // count -- don't leave a stale "...sent" status up forever if the
         // link itself has dropped.
         log.pending = None;
         log.push_status("CMD FAILED -- link lost");
+        Some(PollOutcome::Failed)
+    } else {
+        None
     }
 }

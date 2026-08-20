@@ -1,6 +1,7 @@
-//! Rust port of `tests/test_packet.py`. Same behavior, same cases -- this is
-//! the spec the Python suite already validated against, translated rather
-//! than re-derived. Keep the two files in sync when either changes.
+//! Was a Rust port of `tests/test_packet.py`; as of 2026-08-19 Python is
+//! retired (prototyping history, not maintained in parallel anymore --
+//! see `common/src/lib.rs`'s module docs), so this file is no longer
+//! kept in sync with it.
 
 use launchcast_common::*;
 
@@ -19,7 +20,7 @@ fn sample() -> TelemetryInput {
         batt_volts: 3.94,
         has_fix: true,
         satellites: 9,
-        cam_rec: 0,
+        flight_count: 0,
         sensors: Sensor::ALL,
         fw_version: 7,
     }
@@ -379,9 +380,158 @@ fn command_values_are_distinct() {
 
 #[test]
 fn packet_types_are_distinct_and_nonzero() {
-    assert_ne!(PKT_TELEMETRY, PKT_COMMAND);
-    assert_ne!(PKT_TELEMETRY, 0);
-    assert_ne!(PKT_COMMAND, 0);
+    let types = [PKT_TELEMETRY, PKT_COMMAND, PKT_SUMMARY, PKT_FLIGHT_INDEX];
+    let mut unique = types.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(types.len(), unique.len());
+    assert!(types.iter().all(|&t| t != 0));
+}
+
+#[test]
+fn flight_count_survives_the_wire() {
+    let mut input = sample();
+    input.flight_count = 12;
+    let out = unpack_telemetry(&pack_telemetry(&input)).unwrap();
+    assert_eq!(out.flight_count, 12);
+}
+
+// --- Summary -----------------------------------------------------------------------
+
+fn sample_summary() -> SummaryInput {
+    SummaryInput {
+        flight_index: 3,
+        wait_ms: 4_500,
+        boost_ms: 1_600,
+        coast_ms: 5_200,
+        descent_ms: 42_000,
+        arm_lat: 41.2565,
+        arm_lon: -95.9345,
+        landed_lat: 41.2601,
+        landed_lon: -95.9298,
+        max_speed_mps: 68.3,
+        max_alt_m: 287.4,
+        temp_at_max_alt_c: -8.2,
+        pressure_at_max_alt_hpa: 948.6,
+        max_accel_g: 12.7,
+        max_gyro_dps: 340.0,
+        record_count: 5917,
+        arm_epoch_s: 1_787_160_600,
+    }
+}
+
+#[test]
+fn summary_is_67_bytes() {
+    assert_eq!(SUMMARY_SIZE, 67);
+}
+
+#[test]
+fn summary_round_trip() {
+    let out = unpack_summary(&pack_summary(&sample_summary())).unwrap();
+    assert_eq!(out, sample_summary());
+}
+
+#[test]
+fn summary_reject_wrong_length() {
+    assert!(unpack_summary(&[0u8; 66]).is_none());
+    assert!(unpack_summary(&[0u8; 68]).is_none());
+}
+
+#[test]
+fn summary_reject_bad_magic() {
+    let mut frame = pack_summary(&sample_summary());
+    frame[0] = 0x00;
+    assert!(unpack_summary(&frame).is_none());
+}
+
+#[test]
+fn summary_reject_wrong_packet_type() {
+    let mut frame = pack_summary(&sample_summary());
+    frame[1] = PKT_TELEMETRY;
+    assert!(unpack_summary(&frame).is_none());
+}
+
+#[test]
+fn summary_rejects_a_telemetry_frame() {
+    assert!(unpack_summary(&pack_telemetry(&sample())).is_none());
+}
+
+#[test]
+fn get_summary_base_range_does_not_collide_with_other_commands() {
+    let existing = [
+        Command::PING,
+        Command::CHIRP,
+        Command::ARM,
+        Command::DISARM,
+        Command::GET_FLIGHT_INDEX,
+    ];
+    let range_end = Command::GET_SUMMARY_BASE as u16 + MAX_STORED_FLIGHTS as u16;
+    for cmd in existing {
+        assert!(
+            (cmd as u16) < Command::GET_SUMMARY_BASE as u16 || (cmd as u16) >= range_end,
+            "{cmd:#x} collides with the GET_SUMMARY_BASE range"
+        );
+    }
+}
+
+// --- Flight index --------------------------------------------------------------------
+
+#[test]
+fn flight_index_round_trip() {
+    let timestamps = [1_787_000_000u32, 1_787_100_000, 1_787_200_000];
+    let packed = pack_flight_index(&timestamps);
+    let out = unpack_flight_index(&packed).expect("should decode");
+    assert_eq!(out.as_slice(), &timestamps);
+}
+
+#[test]
+fn flight_index_empty_list_round_trips() {
+    let packed = pack_flight_index(&[]);
+    assert_eq!(packed.len(), 3); // just the header, no entries
+    let out = unpack_flight_index(&packed).expect("should decode");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn flight_index_size_scales_with_count_not_the_max() {
+    let packed = pack_flight_index(&[1_787_000_000]);
+    assert_eq!(packed.len(), 3 + 4); // header + one u32, not FLIGHT_INDEX_MAX_SIZE
+}
+
+#[test]
+fn flight_index_caps_at_max_stored_flights() {
+    let timestamps = [1_787_000_000u32; 40]; // more than MAX_STORED_FLIGHTS (32)
+    let packed = pack_flight_index(&timestamps);
+    let out = unpack_flight_index(&packed).expect("should decode");
+    assert_eq!(out.len(), MAX_STORED_FLIGHTS as usize);
+}
+
+#[test]
+fn flight_index_rejects_a_count_that_does_not_match_the_payload() {
+    let mut packed = pack_flight_index(&[1_787_000_000, 1_787_100_000]);
+    packed[2] = 5; // claims 5 entries, only 2 are actually present
+    assert!(unpack_flight_index(&packed).is_none());
+}
+
+#[test]
+fn flight_index_rejects_bad_magic() {
+    let mut packed = pack_flight_index(&[1_787_000_000]);
+    packed[0] = 0x00;
+    assert!(unpack_flight_index(&packed).is_none());
+}
+
+#[test]
+fn flight_index_rejects_wrong_packet_type() {
+    let mut packed = pack_flight_index(&[1_787_000_000]);
+    packed[1] = PKT_SUMMARY;
+    assert!(unpack_flight_index(&packed).is_none());
+}
+
+#[test]
+fn get_summary_base_range_fits_in_a_u8() {
+    // The whole point of encoding the index in the command byte itself --
+    // this must never wrap.
+    assert!(Command::GET_SUMMARY_BASE as u16 + MAX_STORED_FLIGHTS as u16 <= 256);
 }
 
 #[test]

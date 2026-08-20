@@ -11,11 +11,14 @@ pub mod bmp580;
 pub mod buzzer;
 pub mod flash_log;
 pub mod flight_state;
+pub mod flight_summary;
 pub mod imu;
 pub mod lis3mdl;
 pub mod pixel;
 
 pub use flight_state::{
-    accel_magnitude, FlightState, APOGEE_VEL_MPS, BOOST_MIN_MS, BOOST_THRESHOLD_G,
-    COAST_THRESHOLD_G, DESCENT_VEL_MPS, LANDED_ALT_M, LANDED_HOLD_MS, LANDED_VEL_MPS,
+    accel_magnitude, gyro_magnitude, FlightState, APOGEE_VEL_MPS, BOOST_MIN_MS,
+    BOOST_THRESHOLD_G, COAST_THRESHOLD_G, DESCENT_VEL_MPS, LANDED_ALT_M, LANDED_HOLD_MS,
+    LANDED_VEL_MPS,
 };
+pub use flight_summary::FlightSummary;

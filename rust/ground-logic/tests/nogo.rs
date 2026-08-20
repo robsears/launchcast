@@ -16,7 +16,7 @@ fn telemetry(batt_volts: f32, sensors: u8) -> Telemetry {
         batt_volts,
         has_fix: false,
         satellites: 0,
-        cam_rec: false,
+        flight_count: 0,
         sensors,
         fw_version: 0,
     }

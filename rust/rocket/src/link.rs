@@ -16,6 +16,7 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
+use launchcast_common as common;
 
 #[derive(Clone, Copy)]
 pub struct LatestTelemetry {
@@ -31,6 +32,10 @@ pub struct LatestTelemetry {
     pub has_fix: bool,
     pub satellites: u8,
     pub sensors: u8,
+    /// How many completed flight summaries core1 currently has stored --
+    /// see `flight_summary.rs`. Copied straight into
+    /// `common::TelemetryInput::flight_count` at TX time.
+    pub flight_count: u8,
 }
 
 /// core1 -> core0. `None` until core1's first loop iteration.
@@ -42,3 +47,22 @@ pub static TELEMETRY: Mutex<CriticalSectionRawMutex, Option<LatestTelemetry>> = 
 /// the raw `(seq, cmd)` pair off the radio -- core1 only ever sees
 /// commands already known to be new.
 pub static COMMANDS: Channel<CriticalSectionRawMutex, u8, 4> = Channel::new();
+
+/// core1 -> core0: a summary response to radio out. Carries the
+/// unpacked `SummaryInput`, not pre-packed bytes -- matches `TELEMETRY`'s
+/// own shape (core0's `Radio::send_summary`, like `send_telemetry`, does
+/// the actual `common::pack_summary` call), since only core0 owns the
+/// radio (see `main.rs`'s module docs on the core split) but core1 owns
+/// the stored-flights list this is built from. Capacity 1: the ground
+/// station only ever has one summary request pending at a time (it waits
+/// for a response or a timeout before sending the next), so there's
+/// never a reason for more than one of these in flight.
+pub static SUMMARY_RESPONSE: Channel<CriticalSectionRawMutex, common::SummaryInput, 1> = Channel::new();
+
+/// core1 -> core0: an ordered (oldest-first) list of ARM timestamps to
+/// radio out in response to `Command::GET_FLIGHT_INDEX` -- same
+/// reasoning as `SUMMARY_RESPONSE` (core0 owns the radio, core1 owns
+/// the stored-flights list this is built from), same capacity-1
+/// justification (one request outstanding at a time).
+pub static FLIGHT_INDEX_RESPONSE: Channel<CriticalSectionRawMutex, heapless::Vec<u32, { common::MAX_STORED_FLIGHTS as usize }>, 1> =
+    Channel::new();

@@ -126,6 +126,143 @@ pub struct RmcFix {
     /// field blank when the receiver isn't moving fast enough to compute
     /// a reliable course.
     pub track_deg: Option<f32>,
+    /// UTC date+time, if both the sentence's time and date fields parsed
+    /// cleanly -- `None` on a cold start, before the receiver has
+    /// decoded enough of the satellite signal to know the time at all
+    /// (empty fields), not tied to `valid`: a receiver can know the time
+    /// before it has a full position fix. See [`UtcDateTime`]/[`unix_ms`]
+    /// for turning this into a wall-clock reference -- callers decide
+    /// for themselves whether to also require `valid` before trusting it
+    /// for their own purposes.
+    pub utc: Option<UtcDateTime>,
+}
+
+/// A UTC calendar date + time-of-day, parsed from an NMEA sentence's
+/// `hhmmss.sss` and `ddmmyy` fields. Deliberately not a general-purpose
+/// datetime type (no timezone, no arithmetic beyond [`unix_ms`]) -- this
+/// project only ever needs "what UTC instant was this," once, to
+/// establish a wall-clock reference against each board's own free-
+/// running monotonic clock (see `rocket/src/gps.rs`/`ground/src/gps.rs`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UtcDateTime {
+    /// Full year -- NMEA's `yy` is 2 digits, assumed `2000 + yy` (the
+    /// standard NMEA convention; fine for any realistic lifetime of this
+    /// hardware).
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub millis: u16,
+}
+
+/// Days since the Unix epoch (1970-01-01) for a given proleptic
+/// Gregorian civil date. Howard Hinnant's `days_from_civil` algorithm
+/// (public domain, the same integer math used inside most datetime
+/// libraries' own guts) -- hand-rolled here rather than pulling in a
+/// datetime crate: the only thing this project ever needs is exactly
+/// this one conversion, no timezones, no calendar arithmetic beyond it,
+/// so a crate would be more dependency than the problem calls for.
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64; // [0, 399]
+    let mp = (if m > 2 { m - 3 } else { m + 9 }) as i64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era as i64 * 146097 + doe - 719468
+}
+
+/// Convert a UTC date+time to milliseconds since the Unix epoch.
+pub fn unix_ms(dt: &UtcDateTime) -> i64 {
+    let days = days_from_civil(dt.year as i32, dt.month as u32, dt.day as u32);
+    days * 86_400_000
+        + dt.hour as i64 * 3_600_000
+        + dt.minute as i64 * 60_000
+        + dt.second as i64 * 1000
+        + dt.millis as i64
+}
+
+/// Inverse of `days_from_civil` -- days since the Unix epoch back to a
+/// proleptic Gregorian civil date. Same Hinnant algorithm family, same
+/// public-domain source.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+/// Inverse of `unix_ms` -- milliseconds since the Unix epoch back to a
+/// [`UtcDateTime`], for displaying `arm_epoch_s` on the SUMMARY screen.
+pub fn from_unix_ms(ms: i64) -> UtcDateTime {
+    let days = ms.div_euclid(86_400_000);
+    let ms_of_day = ms.rem_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    let hour = (ms_of_day / 3_600_000) as u8;
+    let minute = ((ms_of_day / 60_000) % 60) as u8;
+    let second = ((ms_of_day / 1000) % 60) as u8;
+    let millis = (ms_of_day % 1000) as u16;
+    UtcDateTime {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour,
+        minute,
+        second,
+        millis,
+    }
+}
+
+/// Parse NMEA's `hhmmss.sss` time field and `ddmmyy` date field into a
+/// [`UtcDateTime`]. `None` if either field is missing/too short to
+/// parse (a receiver that hasn't decoded the time yet leaves the time
+/// field blank, same "nothing usable" convention as the rest of this
+/// module) -- not a hard 6-vs-9-character length check on the time
+/// field, since the fractional-seconds part's precision isn't
+/// guaranteed across chip firmware versions.
+fn parse_utc_datetime(time_field: &str, date_field: &str) -> Option<UtcDateTime> {
+    if time_field.len() < 6 || date_field.len() != 6 {
+        return None;
+    }
+    let hour: u8 = time_field.get(0..2)?.parse().ok()?;
+    let minute: u8 = time_field.get(2..4)?.parse().ok()?;
+    let second: u8 = time_field.get(4..6)?.parse().ok()?;
+    let millis: u16 = match time_field.get(6..) {
+        Some(frac) if frac.starts_with('.') && frac.len() > 1 => {
+            let digits = &frac[1..];
+            let value: u32 = digits.parse().ok()?;
+            match digits.len() {
+                1 => (value * 100) as u16,
+                2 => (value * 10) as u16,
+                3 => value as u16,
+                n => (value / 10u32.pow((n - 3) as u32)) as u16,
+            }
+        }
+        _ => 0,
+    };
+
+    let day: u8 = date_field.get(0..2)?.parse().ok()?;
+    let month: u8 = date_field.get(2..4)?.parse().ok()?;
+    let year_2d: u16 = date_field.get(4..6)?.parse().ok()?;
+
+    Some(UtcDateTime {
+        year: 2000 + year_2d,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        millis,
+    })
 }
 
 /// Convert an NMEA `ddmm.mmmm` (or `dddmm.mmmm`) coordinate plus
@@ -163,7 +300,7 @@ pub fn parse_rmc(sentence: &str) -> Option<RmcFix> {
     if talker_type.len() < 3 || &talker_type[talker_type.len() - 3..] != "RMC" {
         return None;
     }
-    let _utc = fields.next()?;
+    let utc_time_raw = fields.next()?;
     let status = fields.next()?;
     let lat_raw = fields.next()?;
     let lat_hemi = fields.next()?;
@@ -171,11 +308,13 @@ pub fn parse_rmc(sentence: &str) -> Option<RmcFix> {
     let lon_hemi = fields.next()?;
     let speed_raw = fields.next()?;
     let track_raw = fields.next()?;
+    let utc_date_raw = fields.next()?;
 
     let lat = coord_to_decimal(lat_raw, lat_hemi)?;
     let lon = coord_to_decimal(lon_raw, lon_hemi)?;
     let speed_knots = speed_raw.parse().unwrap_or(0.0);
     let track_deg = if track_raw.is_empty() { None } else { track_raw.parse().ok() };
+    let utc = parse_utc_datetime(utc_time_raw, utc_date_raw);
 
     Some(RmcFix {
         valid: status == "A",
@@ -183,5 +322,6 @@ pub fn parse_rmc(sentence: &str) -> Option<RmcFix> {
         lon,
         speed_knots,
         track_deg,
+        utc,
     })
 }

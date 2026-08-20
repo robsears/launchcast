@@ -29,9 +29,10 @@ use embassy_rp::i2c::{Blocking, I2c};
 use embassy_rp::peripherals::I2C1;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use heapless::String;
 use launchcast_ground_logic::{parse_rmc, FixAverage, NmeaLineReader};
+use launchcast_common::epoch::EpochOffset;
 use launchcast_common::nmea::framed_command;
 
 /// Confirmed via CLAUDE.md and `adafruit_gps`'s own default -- the
@@ -61,6 +62,14 @@ pub struct MyFix {
 /// read, matching `code.py`'s own `if hw.gps.has_fix:` gate (which only
 /// ever assigns `my_lat`/`my_lon`, never clears them).
 pub static MY_GPS: Mutex<CriticalSectionRawMutex, Option<MyFix>> = Mutex::new(None);
+
+/// Wall-clock reference, captured once on this board's first valid fix
+/// with a decoded UTC time -- see `common::epoch`'s docs. Independent
+/// of the rocket's own `EPOCH_OFFSET` (`rocket/src/gps.rs`): each board
+/// has its own GPS and its own monotonic clock, so there's no cross-
+/// board synchronization here, just the same math done twice. Read by
+/// `screen_header.rs` for the header's wall-clock display.
+pub static EPOCH_OFFSET: Mutex<CriticalSectionRawMutex, Option<EpochOffset>> = Mutex::new(None);
 
 fn send_command(i2c: &mut I2c<'static, I2C1, Blocking>, payload: &str) {
     let cmd: String<32> = framed_command(payload);
@@ -131,6 +140,17 @@ pub async fn gps_task(mut i2c: I2c<'static, I2C1, Blocking>) {
 
                 if let Some((lat, lon)) = avg.mean() {
                     *MY_GPS.lock().await = Some(MyFix { lat, lon, heading });
+                }
+
+                // Capture the wall-clock reference on the first valid
+                // fix that has one -- see EPOCH_OFFSET's docs and
+                // common::epoch's module docs on why this never gets
+                // recomputed after.
+                if let Some(utc) = fix.utc {
+                    let mut offset = EPOCH_OFFSET.lock().await;
+                    if offset.is_none() {
+                        *offset = Some(EpochOffset::capture(&utc, Instant::now().as_millis() as u32));
+                    }
                 }
             }
         }

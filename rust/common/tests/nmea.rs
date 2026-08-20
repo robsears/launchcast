@@ -1,4 +1,4 @@
-use launchcast_common::nmea::{checksum, parse_rmc, NmeaLineReader};
+use launchcast_common::nmea::{checksum, from_unix_ms, parse_rmc, unix_ms, NmeaLineReader, UtcDateTime};
 
 // The textbook example sentence used across NMEA 0183 references
 // (including Wikipedia's NMEA 0183 article) -- checksum 6A is a known
@@ -13,6 +13,71 @@ fn parses_the_textbook_example() {
     assert!((fix.lon - 11.516_67).abs() < 0.001); // 011 + 31.000/60
     assert!((fix.speed_knots - 22.4).abs() < 0.001);
     assert_eq!(fix.track_deg, Some(84.4));
+}
+
+#[test]
+fn textbook_example_date_and_time_fields_parse_correctly() {
+    // Time field 123519 -> 12:35:19; date field 230394 -> day 23, month
+    // 03. The textbook example is a real 1994 sentence, but this parser
+    // deliberately always assumes `2000 + yy` for the 2-digit year (this
+    // hardware will never see a real pre-2000 fix) -- so this sentence's
+    // *year* decodes to 2094, not the sentence's real original 1994.
+    // That's expected, not a bug; `unix_ms_matches_known_reference_
+    // points` below verifies the actual calendar math against
+    // unambiguous modern dates instead.
+    let fix = parse_rmc(EXAMPLE_RMC).expect("valid sentence should parse");
+    let utc = fix.utc.expect("time and date fields are both present");
+    assert_eq!(
+        utc,
+        UtcDateTime { year: 2094, month: 3, day: 23, hour: 12, minute: 35, second: 19, millis: 0 }
+    );
+}
+
+#[test]
+fn unix_ms_matches_known_reference_points() {
+    // 2000-01-01T00:00:00Z (946684800s) and 2026-08-19T17:30:00Z, hand-
+    // verified against days-since-epoch computed independently of
+    // days_from_civil's own implementation.
+    let y2k = UtcDateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0, millis: 0 };
+    assert_eq!(unix_ms(&y2k), 946_684_800_000);
+
+    let recent = UtcDateTime { year: 2026, month: 8, day: 19, hour: 17, minute: 30, second: 0, millis: 0 };
+    assert_eq!(unix_ms(&recent), 1_787_160_600_000);
+}
+
+#[test]
+fn from_unix_ms_matches_known_reference_points() {
+    // Inverse of unix_ms_matches_known_reference_points -- same two
+    // reference instants, going the other direction.
+    let y2k = UtcDateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0, millis: 0 };
+    assert_eq!(from_unix_ms(946_684_800_000), y2k);
+
+    let recent = UtcDateTime { year: 2026, month: 8, day: 19, hour: 17, minute: 30, second: 0, millis: 0 };
+    assert_eq!(from_unix_ms(1_787_160_600_000), recent);
+}
+
+#[test]
+fn unix_ms_round_trips_through_from_unix_ms() {
+    let dt = UtcDateTime { year: 2026, month: 12, day: 31, hour: 23, minute: 59, second: 58, millis: 123 };
+    assert_eq!(from_unix_ms(unix_ms(&dt)), dt);
+}
+
+#[test]
+fn fractional_seconds_are_parsed_as_milliseconds() {
+    let sentence = "$GPRMC,123519.500,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*71";
+    let fix = parse_rmc(sentence).expect("valid sentence should parse");
+    let utc = fix.utc.expect("time and date fields are both present");
+    assert_eq!(utc.second, 19);
+    assert_eq!(utc.millis, 500);
+}
+
+#[test]
+fn missing_time_field_leaves_utc_none() {
+    // A receiver that hasn't decoded the time yet leaves the field
+    // blank -- must not be treated as "midnight," just unknown.
+    let sentence = "$GPRMC,,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*67";
+    let fix = parse_rmc(sentence).expect("still parses -- utc just isn't available");
+    assert_eq!(fix.utc, None);
 }
 
 #[test]

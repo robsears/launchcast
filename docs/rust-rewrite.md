@@ -1247,6 +1247,393 @@ version at `1` would have been actively misleading, not just stale.
 Build/clippy clean, both UF2s regenerated; not yet confirmed on
 hardware via DIAG/CONTROLLER screens as of this entry.
 
+### 2026-08-19 -- wireless flight-summary protocol (FLIGHTS/SUMMARY screens)
+
+New feature, not a fix: a lightweight, on-demand "highlights" digest for
+a completed flight, sent over the same LoRa link, as a fallback/preview
+to physical log retrieval rather than a replacement for it. Scoped down
+from "transfer the full flight" after doing the actual math together
+with the user: a real bench session logs on the order of 10K+ records at
+~108 bytes/record once decoded -- multiple MB, more than either Feather
+has RAM for, and tens of minutes over LoRa's real (not raw-bitrate)
+throughput. A derived-metrics summary, by contrast, fits in one ~55-byte
+packet regardless of how long the flight was -- no chunking/resumable-
+transfer protocol needed at all, which is what made this tractable in an
+afternoon instead of a multi-day protocol design.
+
+**What's in it**, mapped from the user's requested metric list to what's
+actually derivable on the rocket:
+- Wait/boost/coast/descent phase durations -- new: the rocket previously
+  only remembered the *current* state's entry timestamp, not a history
+  of every phase boundary.
+- Overland distance -- the rocket sends the raw ARM and LANDED GPS
+  fixes; the ground computes the distance with `haversine_m`, which it
+  already had (used identically for RECOVERY), rather than duplicating
+  that math on the rocket.
+- Max altitude, speed, G-force, rotation rate -- new running-max
+  tracking. Max altitude specifically could *not* just reuse
+  `FlightState::max_alt_m` -- that field never resets between arm
+  cycles (a pre-existing, unrelated whole-session behavior), so it would
+  have silently leaked an earlier flight's peak into a later one's
+  summary. Max rotation rate is included as a cheap instability sanity
+  check only -- **center of pressure is explicitly out of scope**: that
+  needs the full raw gyro time series analyzed offline (oscillation-
+  frequency-based static-margin estimation) plus known mass properties
+  this system doesn't measure at all, not a single summary packet.
+- Record count -- lets you gauge what a full `pull-log-rust` would even
+  contain before bothering.
+
+**The LANDED GPS fix is locked in at RECOVER, not at the LANDED
+transition** -- a real design correction mid-session. GPS averaging
+resets its ring buffer the instant DESCENT -> LANDED fires (averaging
+only runs while "stationary," and that classification just flipped), so
+snapshotting immediately would have captured an empty/just-reset buffer.
+The rocket is expected to sit in LANDED for however long it takes a
+person to walk over -- RECOVER (the explicit "I have it" signal) is
+exactly the right moment to freeze whatever the average converged to by
+then. User call.
+
+**New pieces**:
+- `rocket-logic::flight_summary::FlightSummary` -- hardware-free
+  accumulator (7 host tests), fed by `rocket/src/main.rs` at ARM (resets,
+  captures the ARM fix), every BOOST-onward transition (closes out a
+  duration bucket), every armed-onward loop tick (running maxes, same
+  gate as the flash log so `record_count` stays honest), and RECOVER
+  (locks in the LANDED fix, archives into storage).
+- `common::PKT_SUMMARY` (0x03) / `SummaryInput`/`Summary` /
+  `pack_summary`/`unpack_summary` -- new ~55-byte wire frame, mirroring
+  `pack_telemetry`'s shape. `Command::GET_SUMMARY_BASE` (0x20) reserves a
+  32-value opcode range (`common::MAX_STORED_FLIGHTS`) so the command
+  byte itself *is* the requested flight index -- no parameter field
+  needed on the fixed 7-byte command packet. Telemetry's long-reserved
+  `cam_rec` byte repurposed as `flight_count` (same category `cam_disk`/
+  `fw_version` came from -- an original camera concept this project
+  never got hardware for).
+- Rocket-side storage: a plain `[Option<FlightSummary>; 32]`, filled
+  front-to-back and `rotate_left`-shifted once full (evicting the
+  oldest) rather than a true ring buffer -- keeps "logical flight index
+  N" always meaning "the Nth-oldest flight still stored" with zero
+  modular-arithmetic bugs to get wrong, at the cost of a trivial ~2KB
+  copy that only ever happens once per RECOVER. **RAM-only, cleared on
+  power cycle** -- a deliberate scope limit, not an oversight: the raw
+  log partition remains the durable source of truth regardless, pullable
+  any time via `pull-log-rust`.
+- Cross-core plumbing: `rocket::link::SUMMARY_RESPONSE`, a new core1 ->
+  core0 channel carrying an unpacked `SummaryInput` (matching
+  `TELEMETRY`'s own shape -- only core0 owns the radio, only core1 owns
+  the stored-flights list). `Radio::send_summary` mirrors
+  `send_telemetry` almost exactly; reuses the *same* `tx_pkt_params` as
+  telemetry despite the different frame size, since explicit-header LoRa
+  mode means that isn't tied to a fixed payload length.
+- Ground-side RX had to change shape, not just grow a new case:
+  `rx_pkt_params` was sized for `TELEMETRY_SIZE` specifically, too small
+  for the new, larger `SUMMARY_SIZE` frame -- resized to the larger of
+  the two. `Radio::try_receive_telemetry` became `try_receive_frame`,
+  returning a new `RxFrame` enum (`Telemetry`/`Summary`) resolved by
+  trying `unpack_telemetry` then `unpack_summary` -- both already gate
+  on exact length as part of their own validation, so at most one can
+  ever succeed for a given frame, no ambiguity.
+- `summary_request.rs` (ground): pending/ready/failed tracking for one
+  outstanding request, deliberately *not* folded into `cmdlog.rs`
+  despite the structural similarity -- `cmdlog::Pending`'s completion
+  condition ("telemetry now reports state X") doesn't fit "a response
+  echoing this same flight index arrived" at all.
+- `screen.rs` extended with FLIGHTS (in the normal MENU-cycling
+  rotation) and SUMMARY (deliberately *not* in it -- reachable only by
+  selecting a flight, exited only back to FLIGHTS via a special-cased
+  MENU handler, not the general `advance()`). `screen_flights.rs`/
+  `screen_summary.rs` are the two new screen bodies; `screen_footer.rs`
+  rewritten to switch on the actual screen index (was a single
+  `is_flight: bool`, too coarse for FLIGHTS'/SUMMARY's own distinct
+  per-button meanings) rather than gaining a third boolean parameter.
+
+**Scope simplifications made along the way, worth flagging back to the
+user rather than silently deciding**:
+- FLIGHTS shows ordinal rows only ("FLIGHT 1".."FLIGHT N"), not
+  durations-in-the-list the user's original mockup showed. The cheaper
+  alternative discussed -- proactively prefetching every flight's
+  summary on screen entry and caching results progressively -- was
+  scoped out for a v1 that ships correct and simple over one that's more
+  complete but untested; upgrading to it later is straightforward (the
+  request/response plumbing already exists per-flight, this would just
+  add a prefetch loop and a small cache array).
+- FLIGHTS is always in the menu rotation (shows "NO FLIGHTS RECORDED
+  YET" at count 0) rather than conditionally appearing only once
+  `flight_count > 0`, as literally described. The existing screen-cycle
+  model (`screen.rs`) has no support for a variable-length rotation;
+  teaching it one felt like more invasive, riskier surgery than the
+  win was worth for what's ultimately a cosmetic difference (you can
+  always reach the screen, it just tells you there's nothing yet
+  instead of not existing at all).
+
+Verified: full workspace build/clippy clean (host + `thumbv6m-none-eabi`
+both boards), `rocket-logic`'s 7 new `FlightSummary` tests and
+`common`'s wire-format round-trip tests pass. **Not yet confirmed on
+real hardware** -- this entire feature, both boards, needs a reflash and
+an actual request/response cycle before it can be called done.
+
+### 2026-08-19 -- flight-summary feature: first bench test, three fixes
+
+First real hardware exercise of the whole feature (ARM -> fly/simulate
+-> RECOVER -> FLIGHTS -> select -> SUMMARY) -- worked, with three real
+findings:
+
+- **SUMMARY screen layout collision**: the "FLIGHT N" title (size-2 text,
+  `embedded-graphics`'s `FONT_10X20`, 20px tall) is drawn at y=44, so it
+  occupies y=44..64 -- the first data row was at y=56, inside that band.
+  Fixed by moving the first row to y=68 (a 4px gap after the title
+  actually ends), not just nudging it the ~5px the symptom suggested at
+  a glance; the real overlap was larger than it looked.
+- **RECOVER only worked from LANDED, not any stuck state**: found on
+  real hardware when a flight got stuck at APOGEE (never transitioned to
+  DESCENT) with no way to recover it at all short of a power cycle.
+  Broadened both sides' state check from `state == LANDED` to `matches!
+  (state, BOOST | COAST | APOGEE | DESCENT | LANDED)` -- `rocket/src/
+  main.rs`'s DISARM handling, `ground/src/frame.rs`'s `landed()` (renamed
+  `recoverable()`), and the ground's hold-dispatch match, which all have
+  to agree since they're independently checking the same condition on
+  opposite ends of the link. Also added an unconditional `log_writer.
+  flush_if_any()` inside the broadened branch -- the existing flush only
+  ever fired on an actual LANDED transition, so a stuck-state recovery
+  could otherwise leave an unflushed tail sitting in the RAM batch
+  buffer.
+- **Temperature/pressure at apogee, added to the summary**: user request
+  after seeing real data -- not independent extremes of their own, but
+  whatever the barometer read at the exact same instant `max_alt_m` was
+  last set (`FlightSummary::observe` gained two parameters,
+  `temp_c`/`pressure_hpa`, already correctly paired with `alt_m` by the
+  caller since all three come from the same barometer read in `rocket/
+  src/main.rs`'s loop -- no new synchronization needed). Wire frame grew
+  8 bytes (`SUMMARY_SIZE`: 55 -> 63) for the two new `f32` fields,
+  inserted right after `max_alt_m` in the layout. New host test
+  (`observe_pairs_temp_and_pressure_with_whichever_reading_set_the_altitude_max`)
+  locks in the pairing behavior specifically (a later non-max-setting
+  observation must not overwrite the values captured at the real max).
+
+Verified: full workspace build/clippy clean (host + `thumbv6m-none-eabi`
+both boards), all host tests pass (9 in `flight_summary.rs` now, `common`'s
+summary round-trip updated for the new 63-byte size). Both UF2s
+regenerated. Not yet re-flashed/re-tested on hardware as of this entry.
+
+### 2026-08-19 -- GPS UTC timestamps, and a real flight-index cache replacing a naive local list
+
+Two related features, both user-driven design after the bench test above:
+
+- **GPS UTC epoch time**: the PA1010D's `$GPRMC` sentences carry a UTC
+  date/time field that was parsed but never read. `common/src/nmea.rs`
+  gained `UtcDateTime`, `days_from_civil`/`civil_from_days` (Howard
+  Hinnant's public-domain civil-calendar algorithms, hand-rolled rather
+  than pulling in a datetime crate — the only thing this project needs is
+  exactly these two conversions), and `unix_ms`/`from_unix_ms` for the
+  round trip. `common/src/epoch.rs`'s `EpochOffset` captures one
+  `(wall_clock_ms, monotonic_ms)` pair from the *first* fix that has both
+  a position and a decoded UTC time, then derives wall-clock time at any
+  later instant by simple addition — never recomputed after capture,
+  since RP2040 clock drift over a bench/field session is nowhere near
+  enough to matter. Each board captures its own offset independently
+  (`rocket/src/gps.rs`, `ground/src/gps.rs`, both a `EPOCH_OFFSET` static
+  next to the existing GPS-fix state) — there's no cross-board time sync,
+  just the same math done twice. `FlightSummary` gained `arm_epoch_s`
+  (rocket resolves it from its own `EPOCH_OFFSET` at ARM time, 0 if no
+  fix yet — `SUMMARY_SIZE` grew 63 -> 67), shown on the SUMMARY screen as
+  `ARMED yyyy-mm-dd hh:mm:ssZ`. The handheld's own current wall-clock
+  time is now shown in the header (`screen_header.rs`, `y=26`, next to
+  the screen name) from its own independent `EpochOffset` — no rocket/
+  wire involvement, blank until this board's own GPS has a fix.
+- **Real flight-index cache, replacing a naive local list**: found by the
+  user reasoning through a real gap — the FLIGHTS screen was rendering
+  off a live telemetry byte (`Telemetry::flight_count`), which can't tell
+  "the rocket really has N flights stored" apart from "the rocket
+  power-cycled and lost its RAM-only flights since we last heard from
+  it." Replaced with an explicit fetch/cache protocol:
+  - New `PKT_FLIGHT_INDEX` wire frame (`Command::GET_FLIGHT_INDEX` ->
+    an ordered list of each stored flight's `arm_epoch_s`) — the first
+    variable-length frame in the protocol (`heapless::Vec`, not
+    padded to a fixed size; confirmed LoRa explicit-header mode allows
+    different frame sizes to share one `tx_pkt_params`, though `rx_pkt_
+    params`'s length is a cap that had to grow to fit it).
+  - `ground/src/flight_index.rs` (new): `IndexState` (`Idle` / `Pending`
+    / `Ready{count}` / `Empty` / `Failed`), plus a per-flight summary
+    cache populated lazily (one `GET_SUMMARY_BASE` per flight actually
+    selected, not all up front) so revisiting an already-viewed flight
+    in the same session costs no further radio round trip
+    (`summary_request::show_cached`). Both caches are invalidated
+    together, in full (not partial) — a rocket-side eviction is rare
+    enough that reasoning about partial staleness isn't worth it —
+    on two triggers: automatically, whenever `cmdlog::poll` reports a
+    successful RECOVER (`PollOutcome::RecoverSucceeded`, `cmdlog.rs`'s
+    `poll` return type grew from `()` accordingly); manually, from the
+    DIAG screen's right button, repurposed from CHIRP (`screen_footer.
+    rs`'s "TAP:RELOAD FLIGHTS").
+  - Auto-fetch: core0's loop checks every tick whether the cache is
+    `Idle` and the user is currently on FLIGHTS with a live/stale link,
+    and fires `GET_FLIGHT_INDEX` if so — covers both "just navigated to
+    FLIGHTS" and "cache just got invalidated while already there" with
+    one condition, no cross-core event needed.
+  - `screen_flights.rs` rewritten to render the cache's `IndexState`
+    directly: `Idle` + link lost -> "flight logs unavailable, rocket not
+    found"; `Idle`/`Pending` -> "loading"; `Failed` -> "failed to fetch
+    data, try again"; `Empty` -> "there are no logs on the rocket";
+    `Ready{count}` -> the ordinal list, unchanged from before (still
+    deliberately no per-row dates — the epoch-time work surfaces on
+    SUMMARY instead, not by reopening FLIGHTS' scope). `frame.rs` gained
+    `flight_index_state` alongside the existing per-draw fields, same
+    "assemble once" pattern as everything else.
+
+Verified: full workspace build/clippy clean (host + `thumbv6m-none-eabi`
+both boards, `-D warnings`), all host tests pass across every crate
+(`common`'s `nmea`/`epoch`/`packet` suites, `rocket-logic`'s
+`flight_summary`, `ground-logic`, `log-decode`). Two now-genuinely-dead
+accessors removed as part of the rewire (`Frame::flight_count`,
+`FlightIndexState::timestamp`, the latter never gaining a caller since
+FLIGHTS stayed ordinal-only). Both UF2s regenerated. Not yet re-flashed/
+re-tested on hardware as of this entry.
+
+### 2026-08-19 -- header layout fix, FLIGHTS refresh button
+
+Two small user-reported follow-ups after seeing the above rendered:
+
+- **Header layout**: the new wall-clock string (previous entry) collided
+  visually with the status icons at its original placement (`x=240,
+  y=26`, under the screen name). Moved to `y=4` — the same row as
+  "LAUNCHCAST" — in the gap between the title and the rocket-status
+  cluster, which was pushed from `x=160` to `x=240` to make room; the
+  handheld's own battery cluster was pushed from `x=315` to `x=355` for
+  the same visual-breathing-room reason (recomputed via the existing
+  `GAP`-offset pattern rather than more hardcoded literals, matching how
+  the rocket cluster was already built).
+- **FLIGHTS refresh on a confirmed-empty cache**: `IndexState::Empty`
+  ("there are no logs on the rocket" — a real, successful response, not
+  a failure) previously left the right button inert, with no way to
+  re-check short of leaving and re-entering FLIGHTS (which the auto-
+  fetch condition doesn't itself retrigger, since it only fires while
+  the cache is `Idle`). Right button now shows `TAP:REFRESH` in that
+  specific state and, on tap, calls `flight_index::invalidate()` —
+  the existing auto-fetch check (same core0-loop condition that handles
+  every other "cache went `Idle` while on FLIGHTS" case) picks it up on
+  its very next tick, so no separate direct-send path was needed.
+  Deliberately scoped to `Empty` only, not `Failed`/`Idle`-link-lost —
+  matches what was actually asked for; those already explain themselves
+  ("try again", "rocket not found") without a dedicated button.
+
+Verified: full workspace build/clippy clean (`-D warnings`, both
+`thumbv6m-none-eabi` targets). No wire/logic changes, so no new host
+tests. Ground UF2 regenerated (rocket unchanged, not rebuilt).
+Re-flashed and confirmed on real hardware — layout and refresh button
+both behave as expected.
+
+### 2026-08-19 -- DIAG footer overflow fix; full background summary prefetch
+
+Two more user-reported items:
+
+- **DIAG's `TAP:RELOAD FLIGHTS` ran off the right edge**: 19 characters
+  at `FONT_6X10`'s 6px/char starting at the shared right-column `x=330`
+  is 114px, past the 400px display width. Shortened to `TAP:CLR CACHE`
+  and moved 10px left (`right_x`, now computed per-screen in
+  `screen_footer.rs` rather than a single hardcoded `text(...,330,...)`
+  call) — 320 + 78px comfortably fits.
+- **Full local caching, not just lazy-on-selection**: previously, a
+  flight's summary was only ever fetched the moment the user selected it
+  on FLIGHTS — reviewing every flight in a session still meant the
+  rocket had to stay powered on and in range the whole time. Added a
+  background prefetch to `flight_index.rs`: once the index itself is
+  `Ready`, core0's loop walks every not-yet-cached index in sequence
+  (lowest first), one `GET_SUMMARY_BASE` in flight at a time (shares the
+  link with everything else, and specifically backs off while a manual
+  FLIGHTS selection has its own request outstanding). An index whose
+  attempt times out is marked `abandoned` (a `u32` bitmask) rather than
+  retried automatically — matches `cmdlog`/`summary_request`'s existing
+  "failures need a deliberate retry" philosophy, so one unreachable
+  entry can't stall the rest of the list forever; the user can still
+  recover it manually by selecting it, unaffected by any of this.
+  Unlike the index fetch itself, prefetch is **not** gated on the
+  FLIGHTS screen being shown — the whole point is to keep making
+  progress in the background after the user moves on, so a later review
+  session can work with the rocket off. `screen_flights.rs` shows a
+  `FETCHING LOGS: cached/total...` banner (in the gap between the header
+  and the list, doesn't block browsing/selecting) for as long as any
+  index remains neither cached nor abandoned.
+
+Verified: full workspace build/clippy clean (`-D warnings`, both
+`thumbv6m-none-eabi` targets), full host test suite still green (no
+wire/logic-crate changes, so no new host tests — this is entirely
+firmware-side state-machine/UI work in `ground/src`). Ground UF2
+regenerated (rocket unchanged, not rebuilt). Not yet re-flashed/
+re-tested on hardware as of this entry.
+
+### 2026-08-19 -- CircuitPython tooling retired from the Nix/Makefile setup
+
+User reorganized the repo: every old CircuitPython/Python file (`common/
+packet.py`, `ground/*.py`, `rocket/*.py`, `tests/test_*.py`) moved to
+`prototyping/`, frozen reference rather than a maintained target. Asked
+to drop every `nix run .#*` action specific to that Python path and add
+a proper one for the UF2 build pipeline that had only ever been run by
+hand (`elf2uf2-rs` from inside the devShell).
+
+- **`Makefile`**: removed everything CircuitPython/mass-storage-specific
+  — `setup-rocket`/`setup-ground` (boot.py volume labeling), `deploy-
+  rocket`/`deploy-ground`(-unlabeled) (`cp` of `.py` files to a mounted
+  `CIRCUITPY` volume), `libs-rocket`/`libs-ground`/`libs-update`
+  (`circup`), the old `pull-log`/`clean-log` (`flight.bin` on a FAT
+  volume — superseded by the Rust firmware's raw-flash-partition logging
+  back on 2026-08-19's "wireless flight-summary protocol" entry),
+  `monitor` (`minicom` against a CircuitPython REPL over USB-CDC serial
+  — doesn't apply at all to the Rust firmware, which logs via `defmt`
+  over RTT, not a serial port), `volumes`/`doctor` (volume discovery +
+  `ruff`/`circup`/`packet.py` checks). Renamed the already-Rust `pull-
+  log-rust`/`clean-log-rust` down to plain `pull-log`/`clean-log` — no
+  more ambiguity now that nothing else uses those names. Added `test`/
+  `clippy`/`check` (workspace host tests, clippy across host crates +
+  both `thumbv6m-none-eabi` firmware crates) and the actually-requested
+  new piece, `build-uf2`: `cargo build --release --target thumbv6m-none-
+  eabi` for `launchcast-ground`/`launchcast-rocket`, then `elf2uf2-rs`
+  each into a flashable `.uf2` — the exact manual sequence that's been
+  run by hand after every change this whole session, now one command.
+- **Real bug caught along the way**: `build-uf2`'s `cargo build`
+  initially failed with `entry point is not in mapped part of file`
+  (the exact failure `rust/.cargo/config.toml`'s own docs already warn
+  about) when invoked via `--manifest-path rust/Cargo.toml` from the
+  repo root, the same pattern the rest of the Makefile already used.
+  Root cause: Cargo's config-file discovery walks up from the *current
+  directory*, not from `--manifest-path`'s directory, so `rust/.cargo/
+  config.toml`'s `-Tlink.x`/`-Tdefmt.x` rustflags were silently never
+  applied, producing a non-bootable binary that "succeeded" right up
+  until `elf2uf2-rs` refused to convert it. Only affects the two
+  `thumbv6m-none-eabi` build/clippy lines (`cd rust &&` now, instead of
+  `--manifest-path`) — host-target lines are unaffected regardless,
+  since those rustflags are scoped to `[target.thumbv6m-none-eabi]`
+  only. Caught by actually running `nix run .#build-uf2` rather than
+  just eyeballing the Makefile.
+- **`nix/apps.nix`**: mirrors the Makefile's new target list --
+  `test`/`clippy`/`check`/`build-uf2`/`pull-log`/`clean-log`, `default`
+  still aliased to `check`. `build-uf2` gets `elf2uf2-rs` as an explicit
+  extra `runtimeInput` (not just ambient-PATH-from-the-devShell, so a
+  bare `nix run .#build-uf2` works standalone); `pull-log`/`clean-log`
+  likewise get `picotool`.
+- **`nix/common.nix`**: dropped `python`/`circup` entirely (nothing left
+  that uses either). Added a new `rustToolchain` package (factored out
+  of `nix/overlays.nix`'s `craneLib` definition, which now builds on top
+  of it instead of duplicating the same `rust-bin` override inline) so
+  every `nix run .#*` app gets a real `cargo`/`rustc`/`clippy` on `PATH`
+  the same way the devShell already does via `craneLib.devShell`,
+  rather than silently depending on being invoked from inside an
+  already-active devShell.
+- **`.github/workflows/ci.yml`**: was still running `ruff check` and
+  `python -m pytest tests/` — both now broken (moved/removed
+  dependency), so CI would have started hard-failing on the very next
+  push regardless of whether anyone touched it. Replaced with a single
+  `nix run --accept-flake-config .#check`.
+
+Verified: `nix flake check` passes; actually *ran* every new app end to
+end (not just read the Nix, which wouldn't have caught the discovery
+bug above) — `nix run .#test`, `.#clippy`, `.#check`, `.#build-uf2`
+(produced both real `.uf2`s), `.#pull-log` (fails cleanly and
+immediately with no board attached, as designed). `nix develop` still
+provides a working `cargo`/`elf2uf2-rs`/`picotool`/`minicom` afterward
+— the devShell's own package list (`fritzing`/`minicom`/`openscad`/
+`cargo-machete`/`treefmt`/`nixfmt`/`elf2uf2-rs`/`picotool`) was left
+untouched, only `common`'s shared baseline changed.
+
 ## Why
 
 Two distinct problems, both experienced directly this session, not

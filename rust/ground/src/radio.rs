@@ -120,6 +120,26 @@ pub struct RxResult {
     pub snr: i16,
 }
 
+/// A successfully decoded flight-summary frame -- see
+/// `summary_request.rs`.
+pub struct SummaryRxResult {
+    pub summary: common::Summary,
+    pub rssi: i16,
+    pub snr: i16,
+}
+
+/// A successfully decoded flight-index frame -- see `flight_index.rs`.
+pub struct FlightIndexRxResult {
+    pub timestamps: heapless::Vec<u32, { common::MAX_STORED_FLIGHTS as usize }>,
+}
+
+/// Either frame type this board can receive -- see `try_receive_frame`.
+pub enum RxFrame {
+    Telemetry(RxResult),
+    Summary(SummaryRxResult),
+    FlightIndex(FlightIndexRxResult),
+}
+
 pub struct Radio {
     lora: LoRa<RadioKind, Delay>,
     mdltn_params: ModulationParams,
@@ -200,10 +220,15 @@ impl Radio {
         )?;
         let tx_pkt_params =
             lora.create_tx_packet_params(PREAMBLE_LEN, false, true, false, &mdltn_params)?;
+        // Sized for the largest of the frame types this board receives
+        // (FLIGHT_INDEX_MAX_SIZE > SUMMARY_SIZE > TELEMETRY_SIZE as of
+        // 2026-08-19) -- explicit header mode means the actual received
+        // length is self-described per-packet, but this still caps the
+        // maximum the receiver will accept, so it has to cover all three.
         let rx_pkt_params = lora.create_rx_packet_params(
             PREAMBLE_LEN,
             false,
-            (RH_HEADER_LEN + common::TELEMETRY_SIZE) as u8,
+            (RH_HEADER_LEN + common::FLIGHT_INDEX_MAX_SIZE) as u8,
             true,
             false,
             &mdltn_params,
@@ -271,15 +296,20 @@ impl Radio {
         result
     }
 
-    /// Listen for one telemetry frame for up to `RX_SYMBOL_TIMEOUT`
-    /// symbols (roughly half a second). `Ok(None)` on a plain timeout --
-    /// normal, since most polls won't catch a fresh frame -- vs `Err` for
-    /// an actual radio fault. A malformed frame (too short to even hold a
-    /// RadioHead header, or one that fails `unpack_telemetry`'s own
-    /// validation -- bad MAGIC/CRC/length) also comes back as `Ok(None)`,
-    /// indistinguishable from a timeout to the caller, since neither is
-    /// actionable beyond "nothing usable this round."
-    pub async fn try_receive_telemetry(&mut self) -> Result<Option<RxResult>, RadioError> {
+    /// Listen for one frame -- telemetry or a flight summary (see
+    /// [`RxFrame`]) -- for up to `RX_SYMBOL_TIMEOUT` symbols (roughly
+    /// half a second). `Ok(None)` on a plain timeout -- normal, since
+    /// most polls won't catch a fresh frame -- vs `Err` for an actual
+    /// radio fault. A malformed frame (too short to even hold a
+    /// RadioHead header, or one that fails *both* `unpack_telemetry`'s
+    /// and `unpack_summary`'s own validation -- bad MAGIC/type/length)
+    /// also comes back as `Ok(None)`, indistinguishable from a timeout to
+    /// the caller, since neither is actionable beyond "nothing usable
+    /// this round." Tries telemetry first, then summary -- both unpack
+    /// functions already gate on exact length as part of their own
+    /// validation, so at most one of them can ever succeed for a given
+    /// frame; there's no ambiguity to resolve.
+    pub async fn try_receive_frame(&mut self) -> Result<Option<RxFrame>, RadioError> {
         // Replicates `LoRa::complete_rx`'s own loop by hand, using only
         // its public building blocks (`process_irq_event`, `wait_for_irq`,
         // `get_rx_result`), instead of calling `complete_rx` itself --
@@ -326,7 +356,8 @@ impl Radio {
             self.lora.wait_for_irq().await?;
         }
 
-        let mut buf = [0u8; RH_HEADER_LEN + common::TELEMETRY_SIZE];
+        // Sized for the largest of the three frame types -- see rx_pkt_params.
+        let mut buf = [0u8; RH_HEADER_LEN + common::FLIGHT_INDEX_MAX_SIZE];
         let (len, status) = self.lora.get_rx_result(&self.rx_pkt_params, &mut buf).await?;
         log_line(format_args!("got {len}B rssi={} snr={}", status.rssi, status.snr)).await;
         let len = len as usize;
@@ -336,22 +367,30 @@ impl Radio {
         }
         // Strip the RadioHead header the rocket's send() prepended -- see
         // this module's docs on RH_HEADER_LEN.
-        let telemetry = common::unpack_telemetry(&buf[RH_HEADER_LEN..len]);
-        match telemetry {
-            Some(t) => {
-                PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(RxResult {
-                    telemetry: t,
-                    rssi: status.rssi,
-                    snr: status.snr,
-                }))
-            }
-            None => {
-                REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
-                log_line(format_args!("unpack_telemetry rejected frame")).await;
-                Ok(None)
-            }
+        let payload = &buf[RH_HEADER_LEN..len];
+
+        if let Some(t) = common::unpack_telemetry(payload) {
+            PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(RxFrame::Telemetry(RxResult {
+                telemetry: t,
+                rssi: status.rssi,
+                snr: status.snr,
+            })));
         }
+        if let Some(s) = common::unpack_summary(payload) {
+            return Ok(Some(RxFrame::Summary(SummaryRxResult {
+                summary: s,
+                rssi: status.rssi,
+                snr: status.snr,
+            })));
+        }
+        if let Some(timestamps) = common::unpack_flight_index(payload) {
+            return Ok(Some(RxFrame::FlightIndex(FlightIndexRxResult { timestamps })));
+        }
+
+        REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+        log_line(format_args!("frame rejected by unpack_telemetry, unpack_summary, and unpack_flight_index")).await;
+        Ok(None)
     }
 }
 

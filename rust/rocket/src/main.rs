@@ -55,7 +55,7 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_hal_bus::i2c::RefCellDevice;
 use launchcast_common::{self as common, Command, Sensor, State};
 use launchcast_rocket_logic::flash_log::LogEntry;
-use launchcast_rocket_logic::{accel_magnitude, FlightState};
+use launchcast_rocket_logic::{accel_magnitude, gyro_magnitude, FlightState, FlightSummary};
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -338,6 +338,22 @@ async fn flight_task(
 
     let mut log_writer = flash_log::LogWriter::new(Instant::now());
 
+    // -- flight-summary storage (see rocket-logic::flight_summary) -------------
+    // Plain array filled front-to-back, not a ring buffer: once full, the
+    // whole thing shifts left by one (evicting the oldest) rather than
+    // wrapping an index -- keeps "logical flight index N" always meaning
+    // "the Nth-oldest flight still stored," with no modular arithmetic to
+    // get wrong. The shift is a trivial ~2KB copy that only ever happens
+    // once per RECOVER, nowhere near a hot path.
+    let mut stored_flights: [Option<FlightSummary>; common::MAX_STORED_FLIGHTS as usize] =
+        [None; common::MAX_STORED_FLIGHTS as usize];
+    let mut stored_count: usize = 0;
+    // The flight currently in progress -- `Some` from ARM until RECOVER
+    // archives it into `stored_flights` (see the DISARM-from-LANDED
+    // branch below), `None` otherwise (including the whole aborted-arm
+    // case, matching how that already leaves no flash-log session).
+    let mut current_summary: Option<FlightSummary> = None;
+
     loop {
         let now = Instant::now();
         let now_ms = now.as_millis() as u32;
@@ -381,6 +397,11 @@ async fn flight_task(
                     gyro_dps: gyro,
                 })
                 .await;
+            // Same gate as the log write, so record_count stays in
+            // lockstep with what's actually on flash this flight.
+            if let Some(summary) = current_summary.as_mut() {
+                summary.observe(fs.alt_m, fs.vel_mps, accel_g_mag, gyro_magnitude(gyro), temp_c, pressure);
+            }
         }
         log_writer.maybe_flush_on_timer(now).await;
 
@@ -388,6 +409,9 @@ async fn flight_task(
         if fs.update(accel_g_mag, now_ms) {
             pixel.set_state(fs.state).await;
             defmt::info!("-> {} alt={} vel={}", fs.state, fs.alt_m, fs.vel_mps);
+            if let Some(summary) = current_summary.as_mut() {
+                summary.on_transition(fs.state, now_ms);
+            }
             if fs.state == State::LANDED {
                 log_writer.flush_if_any().await;
             }
@@ -427,6 +451,15 @@ async fn flight_task(
                     fs.transition(State::ARMED, now_ms);
                     pixel.set_state(State::ARMED).await;
                     flash_log::ARM_CYCLE_EVENTS.send(flash_log::ArmCycleEvent::Start).await;
+                    let arm_fix = {
+                        let g = *gps::GPS_FIX.lock().await;
+                        if g.has_fix { Some((g.lat, g.lon)) } else { None }
+                    };
+                    let arm_epoch_s = {
+                        let offset = gps::EPOCH_OFFSET.lock().await;
+                        offset.map_or(0, |o| (o.wall_clock_ms(now_ms) / 1000) as u32)
+                    };
+                    current_summary = Some(FlightSummary::on_armed(now_ms, arm_fix, arm_epoch_s));
                     defmt::info!("ARMED ground_p={}", pressure);
                 }
             } else if cmd == Command::DISARM && fs.state == State::ARMED {
@@ -437,20 +470,81 @@ async fn flight_task(
                 // 2026-08-18, see docs/rust-rewrite.md.
                 flash_log::ARM_CYCLE_EVENTS.send(flash_log::ArmCycleEvent::RewindWithoutBoost).await;
                 defmt::info!("DISARMED (log rewound)");
-            } else if cmd == Command::DISARM && fs.state == State::LANDED {
+            } else if cmd == Command::DISARM
+                && matches!(fs.state, State::BOOST | State::COAST | State::APOGEE | State::DESCENT | State::LANDED)
+            {
                 // "RECOVER" on the ground station's footer -- same wire
-                // command as DISARM (no protocol change needed), but from
-                // LANDED this just silences the recovery beacon and
-                // returns to IDLE for the next flight. Deliberately does
-                // NOT send RewindWithoutBoost: unlike an aborted pre-boost
-                // arm, this flight is real and its data is already
-                // flushed (see the LANDED-transition flush above) -- user
-                // call, 2026-08-19, after finding out the hard way there
-                // was previously no way out of LANDED at all short of a
-                // power cycle.
+                // command as DISARM (no protocol change needed). Valid
+                // from *any* post-ARMED state, not just LANDED: found on
+                // real hardware (2026-08-19) that a flight can get stuck
+                // mid-state-machine (e.g. APOGEE never actually
+                // transitioning to DESCENT) with no way out at all short
+                // of a power cycle, since RECOVER originally only
+                // accepted LANDED. Silences the beacon (a no-op if it
+                // was never sounding, e.g. stuck pre-LANDED) and returns
+                // to IDLE. Deliberately does NOT send
+                // RewindWithoutBoost: unlike an aborted pre-boost arm
+                // (the ARMED branch above), boost has already happened
+                // by any of these states, so there's real flight data to
+                // keep, not discard.
                 fs.transition(State::IDLE, now_ms);
                 pixel.set_state(State::IDLE).await;
+                // Force a flush regardless of which state this recovered
+                // from -- the LANDED-transition flush above only ever
+                // fires if LANDED was actually reached; a stuck-state
+                // recovery must not leave an unflushed tail sitting in
+                // the RAM batch buffer.
+                log_writer.flush_if_any().await;
+                // Archive the completed flight -- see rocket-logic::
+                // flight_summary's docs on why the LANDED fix is locked
+                // in here (at RECOVER), not at the LANDED transition.
+                if let Some(mut summary) = current_summary.take() {
+                    let g = *gps::GPS_FIX.lock().await;
+                    summary.lock_in_landed_fix(g.lat, g.lon);
+                    if stored_count == stored_flights.len() {
+                        stored_flights.rotate_left(1);
+                        stored_count -= 1;
+                    }
+                    stored_flights[stored_count] = Some(summary);
+                    stored_count += 1;
+                }
                 defmt::info!("RECOVERED -- beacon silenced, back to IDLE");
+            } else if (Command::GET_SUMMARY_BASE..Command::GET_SUMMARY_BASE + common::MAX_STORED_FLIGHTS).contains(&cmd) {
+                let idx = (cmd - Command::GET_SUMMARY_BASE) as usize;
+                if let Some(Some(summary)) = stored_flights.get(idx) {
+                    let _ = link::SUMMARY_RESPONSE.try_send(common::SummaryInput {
+                        flight_index: idx as u8,
+                        wait_ms: summary.wait_ms,
+                        boost_ms: summary.boost_ms,
+                        coast_ms: summary.coast_ms,
+                        descent_ms: summary.descent_ms,
+                        arm_lat: summary.arm_lat,
+                        arm_lon: summary.arm_lon,
+                        landed_lat: summary.landed_lat,
+                        landed_lon: summary.landed_lon,
+                        max_speed_mps: summary.max_speed_mps,
+                        max_alt_m: summary.max_alt_m,
+                        temp_at_max_alt_c: summary.temp_at_max_alt_c,
+                        pressure_at_max_alt_hpa: summary.pressure_at_max_alt_hpa,
+                        max_accel_g: summary.max_accel_g,
+                        max_gyro_dps: summary.max_gyro_dps,
+                        record_count: summary.record_count,
+                        arm_epoch_s: summary.arm_epoch_s,
+                    });
+                }
+                // else: no summary at that index -- silently ignore, the
+                // ground station's existing pending-command timeout
+                // already covers "no response arrived" as a failure.
+            } else if cmd == Command::GET_FLIGHT_INDEX {
+                // The ground station's actual source of truth for what
+                // flights exist -- see common::pack_flight_index's docs.
+                // Oldest-first, matching stored_flights' own front-to-
+                // back layout and GET_SUMMARY_BASE's index convention.
+                let mut timestamps: heapless::Vec<u32, { common::MAX_STORED_FLIGHTS as usize }> = heapless::Vec::new();
+                for summary in stored_flights[..stored_count].iter().flatten() {
+                    let _ = timestamps.push(summary.arm_epoch_s);
+                }
+                let _ = link::FLIGHT_INDEX_RESPONSE.try_send(timestamps);
             } else if cmd == Command::CHIRP {
                 chirp_until = now_ms.wrapping_add(CHIRP_MS);
             }
@@ -486,6 +580,7 @@ async fn flight_task(
             has_fix,
             satellites: 0, // see gps.rs's docs on the satellite-count simplification
             sensors,
+            flight_count: stored_count as u8,
         });
 
         Timer::after_millis(5).await;
@@ -551,6 +646,23 @@ async fn core0_task(
             }
         }
 
+        // -- send a pending flight-summary response, if core1 built one -------
+        // Ahead of the telemetry-TX block below so a response goes out on
+        // the next loop iteration rather than waiting for the telemetry
+        // timer -- LoRa is half-duplex, so this and telemetry TX still
+        // can't overlap, but there's no reason to add extra latency on
+        // top of that.
+        if let Ok(input) = link::SUMMARY_RESPONSE.try_receive() {
+            if let Err(e) = radio.send_summary(&input).await {
+                defmt::error!("core0: send_summary failed: {}", e);
+            }
+        }
+        if let Ok(timestamps) = link::FLIGHT_INDEX_RESPONSE.try_receive() {
+            if let Err(e) = radio.send_flight_index(&timestamps).await {
+                defmt::error!("core0: send_flight_index failed: {}", e);
+            }
+        }
+
         // -- transmit telemetry, phase-dependent rate --------------------------
         let now_ms = Instant::now().as_millis() as u32;
         if let Some(t) = *link::TELEMETRY.lock().await {
@@ -571,7 +683,7 @@ async fn core0_task(
                     batt_volts: t.batt_volts,
                     has_fix: t.has_fix,
                     satellites: t.satellites,
-                    cam_rec: 0,
+                    flight_count: t.flight_count,
                     // CHG hardcoded 0 -- no bare-metal VBUS/USB-connected
                     // equivalent implemented yet. User call, 2026-08-18:
                     // ship without it rather than take on a full USB

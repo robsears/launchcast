@@ -44,6 +44,17 @@ pub fn accel_magnitude(accel_mps2: [f32; 3]) -> f32 {
     libm::sqrtf(x * x + y * y + z * z) / STANDARD_GRAVITY_MPS2
 }
 
+/// Magnitude of a 3-axis gyroscope reading, in deg/s. Used for
+/// `FlightSummary`'s "max rotation" highlight -- a cheap instability
+/// sanity check, not a stability/center-of-pressure measurement (that
+/// needs the full time series analyzed offline, plus known mass
+/// properties this system doesn't have -- see `flight_summary.rs`'s
+/// docs on scope).
+pub fn gyro_magnitude(gyro_dps: [f32; 3]) -> f32 {
+    let [x, y, z] = gyro_dps;
+    libm::sqrtf(x * x + y * y + z * z)
+}
+
 pub struct FlightState {
     pub state: u8,
     pub ground_pressure: Option<f32>,
